@@ -307,6 +307,7 @@ functions:
         ARTIFACTORY_USERNAME: ${artifactory_username}
         GARASIGN_PASSWORD: ${garasign_password}
         GARASIGN_USERNAME: ${garasign_username}
+        AUTHENTICODE_KEY_NAME: ${authenticode_key_name}
         TASK_ID: ${task_id}
       args:
         - "./scripts/sign_artifacts.sh"
@@ -2002,7 +2003,6 @@ buildvariants:
     tasks:
       - name: "dist"
       - name: "sign"
-        run_on: macos-1014-codesign
       - name: "push"
         run_on: rhel80-small
 
@@ -2019,7 +2019,6 @@ buildvariants:
     tasks:
       - name: "dist"
       - name: "sign"
-        run_on: macos-1014-codesign
       - name: "push"
         run_on: rhel80-small
 
