@@ -64,22 +64,6 @@ repos:
   #
   ####################
 
-  - name: rhel62
-    type: rpm
-    edition: org
-    bucket: repo.mongodb.org
-    repos:
-      - yum/redhat/6/mongodb-org
-      - yum/redhat/6Server/mongodb-org
-
-  - name: rhel67
-    type: rpm
-    edition: org
-    bucket: repo.mongodb.org
-    repos:
-      - yum/redhat/6/mongodb-org
-      - yum/redhat/6Server/mongodb-org
-
   - name: rhel70
     type: rpm
     edition: org
@@ -136,7 +120,7 @@ repos:
       - yum/redhat/8/mongodb-org
       - yum/redhat/8Server/mongodb-org
 
-  - name: rhel90
+  - name: rhel9
     type: rpm
     edition: org
     bucket: repo.mongodb.org
@@ -333,22 +317,6 @@ repos:
   #
   ####################
 
-  - name: rhel62
-    type: rpm
-    edition: enterprise
-    bucket: repo.mongodb.com
-    repos:
-      - yum/redhat/6/mongodb-enterprise
-      - yum/redhat/6Server/mongodb-enterprise
-
-  - name: rhel67
-    type: rpm
-    edition: enterprise
-    bucket: repo.mongodb.com
-    repos:
-      - yum/redhat/6/mongodb-enterprise
-      - yum/redhat/6Server/mongodb-enterprise
-
   - name: rhel70
     type: rpm
     edition: enterprise
@@ -413,7 +381,7 @@ repos:
       - yum/redhat/8/mongodb-enterprise
       - yum/redhat/8Server/mongodb-enterprise
 
-  - name: rhel90
+  - name: rhel9
     type: rpm
     edition: enterprise
     bucket: repo.mongodb.com

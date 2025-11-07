@@ -13,6 +13,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"runtime"
 	"testing"
 
 	"github.com/mongodb/mongo-tools/common/bsonutil"
@@ -22,6 +23,7 @@ import (
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/mongodb/mongo-tools/common/testutil"
 	. "github.com/smartystreets/goconvey/convey"
+	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -128,6 +130,17 @@ func TestMongoExportTOOLS2174(t *testing.T) {
 		t.Fatalf("No cluster available: %v", err)
 	}
 
+	serverVersion, err := sessionProvider.ServerVersionArray()
+	if err != nil {
+		t.Fatalf("Could not get Server version: %v", err)
+	}
+	if serverVersion.GTE(db.Version{8, 2, 0}) {
+		t.Skipf(
+			"createCollection no longer accepts autoIndexID as of Server version 8.2.0; testing with %s",
+			serverVersion.String(),
+		)
+	}
+
 	collName := "tools-2174"
 	dbName := "local"
 
@@ -135,7 +148,7 @@ func TestMongoExportTOOLS2174(t *testing.T) {
 	err = sessionProvider.Run(bson.D{{"drop", collName}}, &r1, dbName)
 	if err != nil {
 		var commandErr mongo.CommandError
-		if !(errors.As(err, &commandErr) && commandErr.Code == 26) {
+		if !errors.As(err, &commandErr) || commandErr.Code != 26 {
 			t.Fatalf("Failed to run drop: %v", err)
 		}
 	}
@@ -190,7 +203,7 @@ func TestMongoExportTOOLS1952(t *testing.T) {
 	err = sessionProvider.Run(bson.D{{"drop", collName}}, &r1, dbName)
 	if err != nil {
 		var commandErr mongo.CommandError
-		if !(errors.As(err, &commandErr) && commandErr.Code == 26) {
+		if !errors.As(err, &commandErr) || commandErr.Code != 26 {
 			t.Fatalf("Failed to run drop: %v", err)
 		}
 	}
@@ -203,12 +216,6 @@ func TestMongoExportTOOLS1952(t *testing.T) {
 	err = sessionProvider.Run(createCmd, &r2, dbName)
 	if err != nil {
 		t.Fatalf("Error creating collection: %v", err)
-	}
-
-	// Check whether we are using MMAPV1.
-	isMMAPV1, err := db.IsMMAPV1(dbStruct, collName)
-	if err != nil {
-		t.Fatalf("Failed to determine storage engine %v", err)
 	}
 
 	// Turn on profiling.
@@ -235,8 +242,6 @@ func TestMongoExportTOOLS1952(t *testing.T) {
 		_, err = me.Export(out)
 		So(err, ShouldBeNil)
 
-		// If we are using mmapv1, we should be hinting an index or using a
-		// snapshot, depending on the version.
 		count, err := profileCollection.CountDocuments(context.Background(),
 			bson.D{
 				{"ns", ns},
@@ -255,13 +260,90 @@ func TestMongoExportTOOLS1952(t *testing.T) {
 			},
 		)
 		So(err, ShouldBeNil)
-		if isMMAPV1 {
-			// There should be exactly one query that matches in MMAPV1
-			So(count, ShouldEqual, 1)
-		} else {
-			// In modern storage engines, there should be no hints, so there
-			// should be 0 matches.
-			So(count, ShouldEqual, 0)
-		}
+
+		// In modern storage engines, there should be no hints, so there
+		// should be 0 matches.
+		So(count, ShouldEqual, 0)
 	})
+}
+
+func TestBadOptions(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	log.SetWriter(io.Discard)
+
+	dbName := "test"
+	collName := "mongoexport-bad-options"
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	if err != nil {
+		t.Fatalf("No cluster available: %v", err)
+	}
+
+	type optionsTestCase struct {
+		name          string
+		optionsFunc   func(Options) Options
+		errorTestFunc func(*testing.T, error)
+	}
+
+	testCases := []optionsTestCase{
+		{
+			name: "missing collection",
+			optionsFunc: func(o Options) Options {
+				o.Collection = ""
+				return o
+			},
+			errorTestFunc: func(t *testing.T, err error) {
+				require.Contains(t, err.Error(), "must specify a collection")
+			},
+		},
+		{
+			name: "bad JSON in query",
+			optionsFunc: func(o Options) Options {
+				o.Query = "{ hello }"
+				return o
+			},
+			errorTestFunc: func(t *testing.T, err error) {
+				require.Regexp(t, `query.+is not valid JSON`, err.Error())
+			},
+		},
+		{
+			name: "invalid sort",
+			optionsFunc: func(o Options) Options {
+				o.Sort = "{ hello }"
+				return o
+			},
+			errorTestFunc: func(t *testing.T, err error) {
+				require.Regexp(t, `query.+is not valid JSON`, err.Error())
+			},
+		},
+		{
+			name: "query file does not exist",
+			optionsFunc: func(o Options) Options {
+				o.QueryFile = "does/not/exist.json"
+				return o
+			},
+			errorTestFunc: func(t *testing.T, err error) {
+				if runtime.GOOS == "windows" {
+					require.Contains(t, err.Error(), "cannot find the path specified")
+				} else {
+					require.Contains(t, err.Error(), "no such file or directory")
+				}
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		require.NoError(t, sessionProvider.DropCollection(dbName, collName))
+
+		require.NoError(t, sessionProvider.CreateCollection(dbName, collName))
+
+		opts := testCase.optionsFunc(simpleMongoExportOpts())
+
+		_, err := New(opts)
+		require.Error(t, err)
+		if testCase.errorTestFunc != nil {
+			testCase.errorTestFunc(t, err)
+		}
+	}
 }

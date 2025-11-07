@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +31,7 @@ var pkgNames = []string{
 }
 
 // minimumGoVersion must be prefixed with v to be parsed by golang.org/x/mod/semver.
-const minimumGoVersion = "v1.21.10"
+const minimumGoVersion = "v1.22.3"
 
 func CheckMinimumGoVersion(ctx *task.Context) error {
 	goVersionStr, err := runCmd(ctx, "go", "version")
@@ -38,7 +39,7 @@ func CheckMinimumGoVersion(ctx *task.Context) error {
 		return fmt.Errorf("failed to get current go version: %w", err)
 	}
 
-	_, _ = ctx.Write([]byte(fmt.Sprintf("Found Go version \"%s\"\n", goVersionStr)))
+	_, _ = fmt.Fprintf(ctx, "Found Go version \"%s\"\n", goVersionStr)
 
 	versionPattern := `go(\d+\.\d+\.*\d*)`
 
@@ -101,20 +102,12 @@ func TestAWSAuth(ctx *task.Context) error {
 // buildToolBinary builds the tool with the specified name, putting
 // the resulting binary into outDir.
 func buildToolBinary(ctx *task.Context, tool string, outDir string) error {
-	pf, err := getPlatform()
-	if err != nil {
-		return err
-	}
-
-	outPath := filepath.Join(outDir, tool+pf.BinaryExt)
+	outPath := filepath.Join(outDir, tool+platform.GetLocalBinaryExt())
 	_ = sh.Remove(ctx, outPath)
 
 	mainFile := filepath.Join(tool, "main", fmt.Sprintf("%s.go", tool))
 
-	buildFlags, err := getBuildFlags(ctx, false)
-	if err != nil {
-		return fmt.Errorf("failed to get build flags: %w", err)
-	}
+	buildFlags := getBuildFlags(ctx, false)
 
 	args := []string{
 		"build",
@@ -124,8 +117,9 @@ func buildToolBinary(ctx *task.Context, tool string, outDir string) error {
 	args = append(args, mainFile)
 
 	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Stderr = os.Stderr
 	sh.LogCmd(ctx, cmd)
-	output, err := cmd.CombinedOutput()
+	output, err := cmd.Output()
 
 	if len(output) > 0 {
 		_, _ = ctx.Write(output)
@@ -146,10 +140,7 @@ func runTests(ctx *task.Context, pkgs []string, testType string) error {
 		}
 		defer outFile.Close()
 
-		buildFlags, err := getBuildFlags(ctx, true)
-		if err != nil {
-			return fmt.Errorf("failed to get build flags: %w", err)
-		}
+		buildFlags := getBuildFlags(ctx, true)
 
 		// Use the recursive wildcard (...) to run all tests
 		// of the provided testType for the current pkg.
@@ -222,38 +213,40 @@ func getLdflags(ctx *task.Context) (string, error) {
 
 // getBuildFlags gets all the build flags that should be used when
 // building the tools on the current platform, including tags and ldflags.
-func getBuildFlags(ctx *task.Context, forTests bool) ([]string, error) {
+func getBuildFlags(ctx *task.Context, forTests bool) []string {
+	flags := []string{}
+
 	ldflags, err := getLdflags(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get ldflags: %w", err)
+	if err == nil {
+		flags = append(flags, "-ldflags", ldflags)
+	} else {
+		ctx.Logf("failed to get ldflags (error: %v); will still attempt build\n", err)
 	}
 
 	tags, err := getTags(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tags: %w", err)
-	}
-
-	flags := []string{
-		"-ldflags", ldflags,
-		"-tags", strings.Join(tags, " "),
+	if err == nil {
+		flags = append(flags, "-tags", strings.Join(tags, " "))
+	} else {
+		ctx.Logf("failed to get tags (error: %v); will still attempt build\n", err)
 	}
 
 	pf, err := getPlatform()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get platform: %w", err)
-	}
-
-	if pf.OS == platform.OSLinux {
-		// We don't want to enable -buildmode=pie for tests. This interferes with enabling the race
-		// detector.
-		if !forTests {
-			flags = append(flags, "-buildmode=pie")
+	if err == nil {
+		switch pf.OS {
+		case platform.OSLinux:
+			// We don't want to enable -buildmode=pie for tests. This interferes with enabling the race
+			// detector.
+			if !forTests {
+				flags = append(flags, "-buildmode=pie")
+			}
+		case platform.OSWindows:
+			flags = append(flags, "-buildmode=exe")
 		}
-	} else if pf.OS == platform.OSWindows {
-		flags = append(flags, "-buildmode=exe")
+	} else {
+		ctx.Logf("failed to get platform (error: %v); will still attempt build\n", err)
 	}
 
-	return flags, nil
+	return flags
 }
 
 // runCmd runs the command with the provided name and arguments, and
@@ -275,9 +268,18 @@ func selectedPkgs(ctx *task.Context) []string {
 	return selectedPkgs
 }
 
-func getPlatform() (platform.Platform, error) {
+func getPlatform() (pf platform.Platform, err error) {
 	if os.Getenv("CI") != "" {
-		return platform.GetFromEnv()
+		pf, err = platform.GetFromEnv()
+		if err == nil {
+			log.Printf("Platform from env: %+v\n", pf)
+		}
+	} else {
+		pf, err = platform.DetectLocal()
+		if err == nil {
+			log.Printf("Platform detected: %+v\n", pf)
+		}
 	}
-	return platform.DetectLocal()
+
+	return
 }

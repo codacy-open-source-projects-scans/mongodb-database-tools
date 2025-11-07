@@ -21,10 +21,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
 	"github.com/youmark/pkcs8"
-	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	mopt "go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
@@ -64,10 +66,10 @@ const (
 	ErrCannotInsertTimeseriesBucketsWithMixedSchema = 408
 )
 
-var ignorableWriteErrorCodes = map[int]bool{
-	ErrDuplicateKeyCode:         true,
-	ErrFailedDocumentValidation: true,
-}
+var ignorableWriteErrorCodes = mapset.NewSet(
+	ErrDuplicateKeyCode,
+	ErrFailedDocumentValidation,
+)
 
 const (
 	continueThroughErrorFormat = "continuing through error: %v"
@@ -121,7 +123,7 @@ func NewSessionProvider(opts options.ToolOptions) (*SessionProvider, error) {
 	}
 	err = client.Ping(context.Background(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to %s: %v", opts.URI.ParsedConnString(), err)
+		return nil, fmt.Errorf("failed to connect to %s: %v", opts.ParsedConnString(), err)
 	}
 
 	// create the provider
@@ -182,7 +184,6 @@ func addClientCertFromBytes(cfg *tls.Config, data []byte, keyPasswd string) (str
 				certDecodedBlock = currentBlock.Bytes
 			}
 		} else if strings.HasSuffix(currentBlock.Type, "PRIVATE KEY") {
-			//nolint:staticcheck
 			isEncrypted := x509.IsEncryptedPEMBlock(currentBlock) || strings.Contains(currentBlock.Type, "ENCRYPTED PRIVATE KEY")
 			if isEncrypted {
 				if keyPasswd == "" {
@@ -192,8 +193,6 @@ func addClientCertFromBytes(cfg *tls.Config, data []byte, keyPasswd string) (str
 				var keyBytes []byte
 				var err error
 				// Process the X.509-encrypted or PKCS-encrypted PEM block.
-				//
-				//nolint:staticcheck
 				if x509.IsEncryptedPEMBlock(currentBlock) {
 					// Only covers encrypted PEM data with a DEK-Info header.
 					keyBytes, err = x509.DecryptPEMBlock(currentBlock, []byte(keyPasswd))
@@ -277,7 +276,7 @@ func addCACertsFromFile(cfg *tls.Config, file string) error {
 		cfg.RootCAs = x509.NewCertPool()
 	}
 
-	if cfg.RootCAs.AppendCertsFromPEM(data) == false {
+	if !cfg.RootCAs.AppendCertsFromPEM(data) {
 		return fmt.Errorf(
 			"SSL trusted server certificates file does not contain any valid certificates. File: `%v`",
 			file,
@@ -286,9 +285,36 @@ func addCACertsFromFile(cfg *tls.Config, file string) error {
 	return nil
 }
 
+// AKSCallback is a callback function that can be used to authenticate with Azure Kubernetes
+// Service. See https://github.com/pmeredit/atlas-azure-fed-auth for testing, speficially the go
+// test with AKS.
+func AKSCallback(
+	ctx context.Context,
+	_ *mopt.OIDCArgs,
+) (*mopt.OIDCCredential, error) {
+	appID := os.Getenv("AZURE_APP_CLIENT_ID")
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return nil, err
+	}
+	opts := policy.TokenRequestOptions{
+		Scopes: []string{
+			fmt.Sprintf("api://%s/.default", appID),
+		},
+	}
+	token, err := cred.GetToken(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &mopt.OIDCCredential{
+		AccessToken: token.Token,
+		ExpiresAt:   &token.ExpiresOn,
+	}, nil
+}
+
 // configure the client according to the options set in the uri and in the provided ToolOptions, with ToolOptions having precedence.
 func configureClient(opts options.ToolOptions) (*mongo.Client, error) {
-	if opts.URI == nil || opts.URI.ConnectionString == "" {
+	if opts.URI == nil || opts.ConnectionString == "" {
 		// XXX Normal operations shouldn't ever reach here because a URI should
 		// be created in options parsing, but tests still manually construct
 		// options and generally don't construct a URI, so we invoke the URI
@@ -299,7 +325,7 @@ func configureClient(opts options.ToolOptions) (*mongo.Client, error) {
 	}
 
 	clientopt := mopt.Client()
-	cs := opts.URI.ParsedConnString()
+	cs := opts.ParsedConnString()
 
 	clientopt.Hosts = cs.Hosts
 
@@ -309,9 +335,9 @@ func configureClient(opts options.ToolOptions) (*mongo.Client, error) {
 
 	clientopt.SetConnectTimeout(time.Duration(opts.Timeout) * time.Second)
 	clientopt.SetSocketTimeout(time.Duration(opts.SocketTimeout) * time.Second)
-	if opts.Connection.ServerSelectionTimeout > 0 {
+	if opts.ServerSelectionTimeout > 0 {
 		clientopt.SetServerSelectionTimeout(
-			time.Duration(opts.Connection.ServerSelectionTimeout) * time.Second,
+			time.Duration(opts.ServerSelectionTimeout) * time.Second,
 		)
 	}
 	if opts.ReplicaSetName != "" {
@@ -424,16 +450,39 @@ func configureClient(opts options.ToolOptions) (*mongo.Client, error) {
 		clientopt.SetWriteConcern(writeconcern.New(opts...))
 	}
 
-	if opts.Auth != nil && opts.Auth.IsSet() {
+	if opts.Auth != nil && opts.IsSet() {
 		cred := mopt.Credential{
-			Username:      opts.Auth.Username,
-			Password:      opts.Auth.Password,
+			Username:      opts.Username,
+			Password:      opts.Password,
 			AuthSource:    opts.GetAuthenticationDatabase(),
-			AuthMechanism: opts.Auth.Mechanism,
+			AuthMechanism: opts.Mechanism,
 		}
-		if cs.AuthMechanism == "MONGODB-AWS" {
+		switch cs.AuthMechanism {
+		case "MONGODB-AWS":
 			cred.Username = cs.Username
 			cred.Password = cs.Password
+			cred.AuthSource = cs.AuthSource
+			cred.AuthMechanism = cs.AuthMechanism
+			cred.AuthMechanismProperties = cs.AuthMechanismProperties
+		case "MONGODB-OIDC":
+			if env, ok := cs.AuthMechanismProperties["ENVIRONMENT"]; ok && env == "azure" {
+				_, okApp := os.LookupEnv("AZURE_APP_CLIENT_ID")
+				_, okClient := os.LookupEnv("AZURE_IDENTITY_CLIENT_ID")
+				_, okTenant := os.LookupEnv("AZURE_TENANT_ID")
+				_, okToken := os.LookupEnv("AZURE_FEDERATED_TOKEN_FILE")
+				if okApp && okClient && okTenant && okToken {
+					cred.OIDCMachineCallback = AKSCallback
+					// We must delete the ENVIRONMENT because we are using a custom
+					// callback
+					delete(cs.AuthMechanismProperties, "ENVIRONMENT")
+				} else if okApp || okClient || okTenant || okToken {
+					return nil, fmt.Errorf(
+						"must set all of AZURE_TENANT_ID, AZURE_APP_CLIENT, AZURE_IDENTITY_CLIENT_ID, " +
+							"and AZURE_FEDERATED_TOKEN_FILE for Azure Kubernetes Service")
+				}
+			}
+			cred.Username = cs.Username
+			// Password is never used
 			cred.AuthSource = cs.AuthSource
 			cred.AuthMechanism = cs.AuthMechanism
 			cred.AuthMechanismProperties = cs.AuthMechanismProperties
@@ -445,8 +494,8 @@ func configureClient(opts options.ToolOptions) (*mongo.Client, error) {
 		}
 		if opts.Kerberos != nil && cred.AuthMechanism == "GSSAPI" {
 			props := make(map[string]string)
-			if opts.Kerberos.Service != "" {
-				props["SERVICE_NAME"] = opts.Kerberos.Service
+			if opts.Service != "" {
+				props["SERVICE_NAME"] = opts.Service
 			}
 			// XXX How do we use opts.Kerberos.ServiceHost if at all?
 			cred.AuthMechanismProperties = props
@@ -463,14 +512,16 @@ func configureClient(opts options.ToolOptions) (*mongo.Client, error) {
 			return nil, fmt.Errorf("CRL files are not supported on this platform")
 		}
 
-		// #nosec G402 -- we intentionally allow old TLS versions for backwards compatibility
+		// #nosec G402 -- We intentionally allow known-insecure TLS options when certain CLI flags
+		// are set. These are `--tlsInsecure`, `--sslAllowInvalidCertificates`, and
+		// `--sslAllowInvalidHostnames`. When these are not set, we use secure TLS settings.
 		tlsConfig := &tls.Config{}
 		if opts.SSLAllowInvalidCert || opts.SSLAllowInvalidHost || opts.TLSInsecure {
 			tlsConfig.InsecureSkipVerify = true
 		}
 
 		var x509Subject string
-		keyPasswd := opts.SSL.SSLPEMKeyPassword
+		keyPasswd := opts.SSLPEMKeyPassword
 		var err error
 		if cs.SSLClientCertificateKeyPasswordSet && cs.SSLClientCertificateKeyPassword != nil {
 			keyPasswd = cs.SSLClientCertificateKeyPassword()
@@ -544,25 +595,13 @@ func CanIgnoreError(err error) bool {
 		return true
 	}
 
-	switch mongoErr := err.(type) {
-	case mongo.WriteError:
-		_, ok := ignorableWriteErrorCodes[mongoErr.Code]
-		return ok
-	case mongo.BulkWriteException:
-		for _, writeErr := range mongoErr.WriteErrors {
-			if _, ok := ignorableWriteErrorCodes[writeErr.Code]; !ok {
-				return false
+	var mongoErr mongo.ServerError
+	if errors.As(err, &mongoErr) {
+		for code := range ignorableWriteErrorCodes.Iter() {
+			if mongoErr.HasErrorCode(code) {
+				return true
 			}
 		}
-
-		if mongoErr.WriteConcernError != nil {
-			log.Logvf(log.Always, "write concern error when inserting documents: %v", mongoErr.WriteConcernError)
-			return false
-		}
-		return true
-	case mongo.CommandError:
-		_, ok := ignorableWriteErrorCodes[int(mongoErr.Code)]
-		return ok
 	}
 
 	return false
@@ -570,46 +609,10 @@ func CanIgnoreError(err error) bool {
 
 // Returns a boolean based on whether the given error indicates that this timeseries collection needs to be updated to set `timeseriesBucketsMayHaveMixedSchemaData` to `true`.
 func TimeseriesBucketNeedsMixedSchema(err error) bool {
-	if err == nil {
-		return false
-	}
+	var mongoErr mongo.ServerError
 
-	switch mongoErr := err.(type) {
-	case mongo.WriteError:
-		return mongoErr.Code == ErrCannotInsertTimeseriesBucketsWithMixedSchema
-
-	case mongo.BulkWriteException:
-		for _, writeErr := range mongoErr.WriteErrors {
-			if writeErr.Code == ErrCannotInsertTimeseriesBucketsWithMixedSchema {
-				return true
-			}
-		}
-		return false
-	}
-	return false
-}
-
-// IsMMAPV1 returns whether the storage engine is MMAPV1. Also returns false
-// if the storage engine type cannot be determined for some reason.
-func IsMMAPV1(database *mongo.Database, collectionName string) (bool, error) {
-	// mmapv1 does not announce itself like other storage engines. Instead,
-	// we check for the key 'numExtents', which only occurs on MMAPV1.
-	const numExtents = "numExtents"
-
-	var collStats map[string]interface{}
-
-	singleRes := database.RunCommand(context.Background(), bson.M{"collStats": collectionName})
-
-	if err := singleRes.Err(); err != nil {
-		return false, err
-	}
-
-	if err := singleRes.Decode(&collStats); err != nil {
-		return false, err
-	}
-
-	_, ok := collStats[numExtents]
-	return ok, nil
+	return errors.As(err, &mongoErr) &&
+		mongoErr.HasErrorCode(ErrCannotInsertTimeseriesBucketsWithMixedSchema)
 }
 
 // GetTimeseriesCollNameFromBucket returns a timeseries collection name from its bucket collection name.

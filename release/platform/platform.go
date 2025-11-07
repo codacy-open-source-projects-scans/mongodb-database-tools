@@ -1,14 +1,20 @@
 package platform
 
 import (
+	"bytes"
+	"cmp"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/mongodb/mongo-tools/release/env"
 	"github.com/mongodb/mongo-tools/release/version"
+	"github.com/samber/lo"
 )
 
 type OS string
@@ -18,6 +24,15 @@ const (
 	OSLinux   OS = "linux"
 	OSMac     OS = "mac"
 )
+
+func (o OS) GoOS() string {
+	switch o {
+	case OSMac:
+		return "darwin"
+	default:
+		return string(o)
+	}
+}
 
 type Pkg string
 
@@ -46,6 +61,18 @@ const (
 	ArchX86_64  Arch = "x86_64"
 )
 
+// GoArch returns the GOARCH value for a given architecture.
+func (a Arch) GoArch() string {
+	switch a {
+	case ArchAarch64:
+		return "arm64"
+	case ArchX86_64:
+		return "amd64"
+	default:
+		return string(a)
+	}
+}
+
 // Platform represents a platform (a combination of OS, distro,
 // version, and architecture) on which we may build/test the tools.
 // There should be at least one evergreen buildvariant per platform,
@@ -55,16 +82,15 @@ type Platform struct {
 	// This is used to override the variant name. It should only be used for
 	// special builds. In general, we want to use the OS name + arch for the
 	// variant name.
-	VariantName       string
-	Arch              Arch
-	OS                OS
-	Pkg               Pkg
-	Repos             []Repo
-	BuildTags         []string
-	BinaryExt         string
-	SkipForJSONFeed   bool
-	ServerVariantName string
-	ServerPlatform    string
+	VariantName        string
+	Arch               Arch
+	OS                 OS
+	Pkg                Pkg
+	Repos              []Repo
+	BuildTags          []string
+	SkipForJSONFeed    bool
+	ServerVariantNames mapset.Set[string]
+	ServerPlatform     string
 	// If set, this a linux release will only be pushed to server repos within this range (inclusive).
 	MinLinuxServerVersion *version.Version
 	MaxLinuxServerVersion *version.Version
@@ -102,6 +128,7 @@ func GetFromEnv() (Platform, error) {
 func DetectLocal() (Platform, error) {
 
 	cmd := exec.Command("uname", "-sm")
+	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	if err != nil {
 		return Platform{}, fmt.Errorf("failed to run uname: %w", err)
@@ -116,30 +143,72 @@ func DetectLocal() (Platform, error) {
 	kernelName := pieces[0]
 	archName := Arch(pieces[1])
 
+	var os string
+	var pf Platform
+	var foundPf bool
+
 	if strings.HasPrefix(kernelName, "CYGWIN") || strings.HasPrefix(kernelName, "MSYS_NT") {
-		pf, ok := GetByVariant("windows")
-		if !ok {
-			panic("windows platform name changed")
+		os = "windows"
+		pf, foundPf = GetByVariant("windows")
+	} else {
+		switch kernelName {
+		case "Linux":
+			var version string
+
+			os, version, err = GetLinuxDistroAndVersion()
+			if err != nil {
+				return Platform{}, fmt.Errorf(
+					"detecting local Linux distro/version: %w",
+					err,
+				)
+			}
+
+			os = strings.ToLower(os)
+			version = strings.ReplaceAll(version, ".", "")
+
+			os += version
+		case "Darwin":
+			os = "macos"
+		default:
+			return Platform{}, fmt.Errorf("failed to detect local platform from kernel name %q", kernelName)
 		}
-		return pf, nil
+
+		pf, foundPf = GetByOsAndArch(os, archName)
 	}
 
-	switch kernelName {
-	case "Linux":
-		pf, ok := GetByOsAndArch("ubuntu1804", archName)
-		if !ok {
-			panic("ubuntu1804 platform name changed")
-		}
-		return pf, nil
-	case "Darwin":
-		pf, ok := GetByOsAndArch("macos", archName)
-		if !ok {
-			panic("macos platform name changed")
-		}
-		return pf, nil
+	if !foundPf {
+		return Platform{}, fmt.Errorf(
+			"no platform %s/%s found; did %s’s platform name change?",
+			os,
+			archName,
+			os,
+		)
 	}
 
-	return Platform{}, fmt.Errorf("failed to detect local platform from kernel name %q", kernelName)
+	return pf, nil
+}
+
+func GetLinuxDistroAndVersion() (string, string, error) {
+	cmd := exec.Command("lsb_release", "--short", "--id")
+	cmd.Stderr = os.Stderr
+	distro, err := cmd.Output()
+
+	if err != nil {
+		return "", "", fmt.Errorf("fetching Linux distro name: %w", err)
+	}
+
+	cmd = exec.Command("lsb_release", "--short", "--release")
+	cmd.Stderr = os.Stderr
+	version, err := cmd.Output()
+
+	if err != nil {
+		return "", "", fmt.Errorf("fetching %#q version: %w", distro, err)
+	}
+
+	distroStr := string(bytes.TrimSpace(distro))
+	versionStr := string(bytes.TrimSpace(version))
+
+	return distroStr, versionStr, nil
 }
 
 func GetByVariant(variant string) (Platform, bool) {
@@ -212,7 +281,7 @@ func (p Platform) ArtifactExtensions() []string {
 	case OSWindows:
 		return []string{"zip", "zip.sig", "msi"}
 	}
-	panic("unreachable")
+	panic(fmt.Sprintf("unreachable; os=%#q", p.OS))
 }
 
 func (p Platform) asGolangString() string {
@@ -253,9 +322,9 @@ func (p Platform) asGolangString() string {
 		}
 	}
 
-	var binaryExt string
-	if p.BinaryExt != "" {
-		binaryExt = indentGolangField("BinaryExt", fmt.Sprintf(`"%s"`, p.BinaryExt))
+	binaryExt := GetLocalBinaryExt()
+	if binaryExt != "" {
+		binaryExt = indentGolangField("BinaryExt", fmt.Sprintf(`"%s"`, binaryExt))
 	}
 
 	return fmt.Sprintf(
@@ -268,6 +337,30 @@ func (p Platform) asGolangString() string {
 		buildTags,
 		binaryExt,
 	)
+}
+
+func GetLocalBinaryExt() string {
+	return lo.Ternary(
+		runtime.GOOS == "windows",
+		".exe",
+		"",
+	)
+}
+
+var canonicalTarget = map[string]string{
+	"rhel80": "rhel8",
+}
+
+func (p Platform) TargetMatches(target string) bool {
+	baseTarget := cmp.Or(p.ServerPlatform, p.Name)
+
+	for _, ref := range []*string{&target, &baseTarget} {
+		if canonical, has := canonicalTarget[*ref]; has {
+			*ref = canonical
+		}
+	}
+
+	return target == baseTarget
 }
 
 func indentGolangField(name, value string) string {
@@ -283,7 +376,7 @@ func (o OS) ConstName() string {
 	case OSMac:
 		return "OSMac"
 	}
-	panic("unreachable")
+	panic(fmt.Sprintf("unreachable; os=%#q", o))
 }
 
 func (o OS) String() string {
@@ -297,7 +390,7 @@ func (p Pkg) ConstName() string {
 	case PkgRPM:
 		return "PkgRPM"
 	}
-	panic("unreachable")
+	panic(fmt.Sprintf("unreachable; pkg=%#q", p))
 }
 
 func (p Pkg) String() string {
@@ -311,7 +404,7 @@ func (r Repo) ConstName() string {
 	case RepoEnterprise:
 		return "RepoEnterprise"
 	}
-	panic("unreachable")
+	panic(fmt.Sprintf("unreachable; repo=%#q", r))
 }
 
 func (r Repo) String() string {
@@ -331,7 +424,7 @@ func (a Arch) ConstName() string {
 	case ArchX86_64:
 		return "ArchX86_64"
 	}
-	panic("unreachable")
+	panic(fmt.Sprintf("unreachable; arch=%#q", a))
 }
 
 func (a Arch) String() string {
@@ -406,13 +499,13 @@ var platforms = []Platform{
 		MaxLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
 	},
 	{
-		Name:              "debian12",
-		Arch:              ArchX86_64,
-		OS:                OSLinux,
-		Pkg:               PkgDeb,
-		Repos:             []Repo{RepoEnterprise, RepoOrg},
-		BuildTags:         defaultBuildTags,
-		ServerVariantName: "enterprise-debian12-64",
+		Name:               "debian12",
+		Arch:               ArchX86_64,
+		OS:                 OSLinux,
+		Pkg:                PkgDeb,
+		Repos:              []Repo{RepoEnterprise, RepoOrg},
+		BuildTags:          defaultBuildTags,
+		ServerVariantNames: mapset.NewSet("enterprise-debian12-64"),
 	},
 	{
 		Name:                  "debian92",
@@ -424,37 +517,27 @@ var platforms = []Platform{
 		MaxLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
 	},
 	{
-		Name:              "macos",
-		Arch:              ArchArm64,
-		OS:                OSMac,
-		BuildTags:         defaultBuildTags,
-		ServerVariantName: "enterprise-macos-arm64",
+		Name:               "macos",
+		Arch:               ArchArm64,
+		OS:                 OSMac,
+		BuildTags:          defaultBuildTags,
+		ServerVariantNames: mapset.NewSet("enterprise-macos-arm64"),
 	},
 	{
-		Name:              "macos",
-		Arch:              ArchX86_64,
-		OS:                OSMac,
-		BuildTags:         defaultBuildTags,
-		ServerVariantName: "enterprise-macos",
-	},
-	// This is a special build that we upload to S3 but not to the release
-	// repos.
-	{
-		Name: "rhel62",
-		// This needs to match the name of the buildvariant in the Evergreen
-		// config.
-		VariantName:           "rhel62-no-kerberos",
-		Arch:                  ArchX86_64,
-		OS:                    OSLinux,
-		Pkg:                   PkgRPM,
-		BuildTags:             []string{"failpoints"},
-		SkipForJSONFeed:       true,
-		ServerVariantName:     "enterprise-rhel-62-64-bit",
-		MaxLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
+		Name:               "macos",
+		Arch:               ArchX86_64,
+		OS:                 OSMac,
+		BuildTags:          defaultBuildTags,
+		ServerVariantNames: mapset.NewSet("enterprise-macos"),
 	},
 	{
-		Name:                  "rhel62",
-		Arch:                  ArchX86_64,
+		// mongodump_passthru_v is the evergreen variant name used for
+		// the passthrough tests. It currently maps to an amazon2-aarch64,
+		// but having a distinct variant name helps in managing Evergreen
+		// and Build Baron.
+		Name:                  "mongodump_passthru_v",
+		VariantName:           "mongodump_passthru_v",
+		Arch:                  ArchAarch64,
 		OS:                    OSLinux,
 		Pkg:                   PkgRPM,
 		Repos:                 []Repo{RepoEnterprise, RepoOrg},
@@ -489,6 +572,24 @@ var platforms = []Platform{
 		MaxLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
 	},
 	{
+		// Same variant name as mongosync passthrough tests to minimize
+		// changes in mongodump-task-gen for mongodump passthrough tests.
+		Name:            "rhel80",
+		Arch:            ArchX86_64,
+		OS:              OSLinux,
+		Pkg:             PkgRPM,
+		Repos:           []Repo{RepoOrg, RepoEnterprise},
+		BuildTags:       defaultBuildTags,
+		SkipForJSONFeed: true,
+		// Using server rhel 80 builds because "enterprise-rhel-80-64-bit" is not available for all server versions.
+		// NB: Older builds are “rhel-80”, while newer ones are just “rhel-8”.
+		ServerVariantNames: mapset.NewSet(
+			"enterprise-rhel-80-64-bit",
+			"enterprise-rhel-8-64-bit",
+		),
+		ServerPlatform: "rhel80",
+	},
+	{
 		Name:      "rhel81",
 		Arch:      ArchPpc64le,
 		OS:        OSLinux,
@@ -520,24 +621,49 @@ var platforms = []Platform{
 		Repos:     []Repo{RepoOrg, RepoEnterprise},
 		BuildTags: defaultBuildTags,
 		// Using server rhel 80 builds because "enterprise-rhel-80-64-bit" is not available for all server versions.
-		ServerVariantName: "enterprise-rhel-80-64-bit",
-		ServerPlatform:    "rhel80",
+		// NB: Older builds are “rhel-80”, while newer ones are just “rhel-8”.
+		ServerVariantNames: mapset.NewSet(
+			"enterprise-rhel-80-64-bit",
+			"enterprise-rhel-8-64-bit",
+		),
+		ServerPlatform: "rhel80",
+	},
+	// MongoDB server only supports enterprise on RHEL9 for s390x and ppc64le, and only version 7.0+ is available.
+	{
+		Name:                  "rhel9",
+		Arch:                  ArchPpc64le,
+		OS:                    OSLinux,
+		Pkg:                   PkgRPM,
+		Repos:                 []Repo{RepoEnterprise},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
 	},
 	{
-		Name:      "rhel93",
-		Arch:      ArchAarch64,
-		OS:        OSLinux,
-		Pkg:       PkgRPM,
-		Repos:     []Repo{RepoOrg, RepoEnterprise},
-		BuildTags: defaultBuildTags,
+		Name:                  "rhel9",
+		Arch:                  ArchS390x,
+		OS:                    OSLinux,
+		Pkg:                   PkgRPM,
+		Repos:                 []Repo{RepoEnterprise},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
 	},
 	{
-		Name:      "rhel93",
-		Arch:      ArchX86_64,
-		OS:        OSLinux,
-		Pkg:       PkgRPM,
-		Repos:     []Repo{RepoOrg, RepoEnterprise},
-		BuildTags: defaultBuildTags,
+		Name:                  "rhel93",
+		Arch:                  ArchAarch64,
+		OS:                    OSLinux,
+		Pkg:                   PkgRPM,
+		Repos:                 []Repo{RepoOrg, RepoEnterprise},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 6, Minor: 0, Patch: 0},
+	},
+	{
+		Name:                  "rhel93",
+		Arch:                  ArchX86_64,
+		OS:                    OSLinux,
+		Pkg:                   PkgRPM,
+		Repos:                 []Repo{RepoOrg, RepoEnterprise},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 6, Minor: 0, Patch: 0},
 	},
 	{
 		Name:                  "suse12",
@@ -643,12 +769,11 @@ var platforms = []Platform{
 		MinLinuxServerVersion: &version.Version{Major: 8, Minor: 0, Patch: 0},
 	},
 	{
-		Name:              "windows",
-		Arch:              ArchX86_64,
-		OS:                OSWindows,
-		BuildTags:         defaultBuildTags,
-		BinaryExt:         ".exe",
-		ServerVariantName: "enterprise-windows",
+		Name:               "windows",
+		Arch:               ArchX86_64,
+		OS:                 OSWindows,
+		BuildTags:          defaultBuildTags,
+		ServerVariantNames: mapset.NewSet("enterprise-windows"),
 	},
 }
 

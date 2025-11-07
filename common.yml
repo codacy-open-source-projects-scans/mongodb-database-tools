@@ -36,6 +36,10 @@ variables:
       mongo_args_tls: "--port 33333 --tls --tlsCAFile common/db/testdata/ca-ia.pem --tlsCertificateKeyFile common/db/testdata/test-server.pem --tlsAllowInvalidCertificates"
       mongod_port: 33333
 
+  # Used to determine load_libs_version for *-latest builds.
+  # Same as maxServerVersion supported in download_server.go
+  max_server_version: &max_server_version "8.2"
+
 parameters:
   - key: fake_tag_for_release_testing
     description: |
@@ -57,7 +61,10 @@ functions:
         chmod +x bin/*
         mv bin/* ${test_path}/
         cd ${test_path}
-        ./mongo --nodb lib/run_mongod.js jstests/tool/*.js
+        if [ -n "${load_libs_version}" ]; then
+          IMPORT_LOAD_LIBS="await import(\"../shell_common/libs/load_libs-${load_libs_version}.js\");"
+        fi
+        ./mongo --nodb --eval "$IMPORT_LOAD_LIBS" lib/run_mongod.js jstests/tool/*.js
 
   "run qa-tests":
     command: subprocess.exec
@@ -295,9 +302,8 @@ functions:
         bucket: mciuploads
 
   "sign artifacts":
-    command: subprocess.exec
+    command: shell.exec
     params:
-      binary: bash
       working_dir: src/github.com/mongodb/mongo-tools
       env:
         MONGO_OS: ${mongo_os}
@@ -308,9 +314,9 @@ functions:
         GARASIGN_PASSWORD: ${garasign_password}
         GARASIGN_USERNAME: ${garasign_username}
         AUTHENTICODE_KEY_NAME: ${authenticode_key_name}
-        TASK_ID: ${task_id}
-      args:
-        - "./scripts/sign_artifacts.sh"
+      script: |
+        ${_set_shell_env}
+        ./scripts/sign_artifacts.sh
 
   "upload signed release artifacts":
     # temporary workaround for TOOLS-2606
@@ -425,8 +431,12 @@ functions:
           elif [ "${USE_SSL}" = "true" ]; then
             NODE_OPTIONS="${replsettest_ssl_config}"
           fi
-
-          PATH=./bin:$PATH ./bin/mongo $MONGO_ARGS --nodb --eval 'TestData = new Object(); TestData.minPort="${mongod_port}"; var repl = new ReplSetTest({nodes:1, name:"repltester", nodeOptions: {'"$NODE_OPTIONS"'}});repl.startSet();repl.initiate();repl.awaitSecondaryNodes();while(true){sleep(1000);}'
+          # use jsconfig.json to set baseUrl to find libs
+          mv test/shell_common/jsconfig.json ./
+          if [ -n "${load_libs_version}" ]; then
+            IMPORT_LOAD_LIBS="await import(\"../shell_common/libs/load_libs-${load_libs_version}.js\");"
+          fi
+          PATH=./bin:$PATH ./bin/mongo $MONGO_ARGS --nodb --eval "$IMPORT_LOAD_LIBS; TestData = new Object(); TestData.minPort=\"${mongod_port}\"; var repl = new ReplSetTest({nodes:1, name:'repltester', nodeOptions: {$NODE_OPTIONS}});repl.startSet();repl.initiate();repl.awaitSecondaryNodes();while(true){sleep(1000);}"
 
     - command: shell.exec
       params:
@@ -539,18 +549,14 @@ functions:
         ${_set_shell_env}
         ./scripts/regenerate-and-diff-sbom-lite.sh
 
-  "generate gosec SARIF report":
-    - command: shell.exec
-      type: test
-      params:
-        working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          ${_set_shell_env}
-          set -x
-          set -v
-          set -e
-          GOSEC_SARIF_REPORT=1 ./dev-bin/precious lint --all --command gosec
-          cat SARIF.json
+  "check sarif report":
+    command: shell.exec
+    type: test
+    params:
+      working_dir: src/github.com/mongodb/mongo-tools
+      script: |
+        ${_set_shell_env}
+        ./scripts/regenerate-and-diff-sarif-report.sh
 
   "create evergreen config file":
     - command: shell.exec
@@ -563,6 +569,29 @@ functions:
           set -v
           set -e
           ./scripts/write-evergreen-config-file.sh
+
+  "set silkbomb credentials":
+    - command: ec2.assume_role
+      display_name: Assume IAM role with permissions to pull Kondukto API token
+      params:
+        role_arn: ${kondukto_role_arn}
+    - command: shell.exec
+      display_name: Pull Kondukto API token from AWS Secrets Manager and write it to file
+      params:
+        silent: true
+        shell: bash
+        include_expansions_in_env:
+          [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN]
+        script: |
+          set -e
+          # use AWS CLI to get the Kondukto API token from AWS Secrets Manager
+          kondukto_token=$(aws secretsmanager get-secret-value --secret-id "kondukto-token" --region "us-east-1" --query 'SecretString' --output text)
+          # set the KONDUKTO_TOKEN environment variable
+          echo "KONDUKTO_TOKEN: $kondukto_token" > kondukto_token.yml
+    - command: expansions.update
+      params:
+        file: kondukto_token.yml
+        redact_file_expansions: true
 
 pre:
   - command: shell.exec
@@ -604,9 +633,6 @@ pre:
           export TOOLS_TESTING_AUTH_PASSWORD='${auth_password}'
           export MONGODB_KERBEROS_PASSWORD='${kerberos_password}'
           export TOOLS_TESTING_PKCS8_PASSWORD='${pkcs8_password}'
-          export SNYK_TOKEN='${snyk_token}'
-          export SILK_CLIENT_ID='${silk_client_id}'
-          export SILK_CLIENT_SECRET='${silk_client_secret}'
           set -o xtrace
           set -o verbose
           set -o errexit
@@ -618,6 +644,18 @@ pre:
   - command: expansions.update
     params:
       file: expansions.yml
+  # Extra pre steps needed for mongodump passthrough.
+  - command: expansions.update
+    params:
+      updates:
+        - key: python
+          value: "/opt/mongodbtoolchain/v4/bin/python3"
+        - key: resmoke_dir
+          value: "src/resmoke"
+        - key: resmoke_venv_dir
+          value: "resmoke-venv"
+        - key: mongosync_binary_folder
+          value: "mongosync-coverage-binary"
 
 post:
   # attach.results works for jstests, gotest.parse_files for golang tests
@@ -663,7 +701,6 @@ timeout:
 tasks:
   - name: dist
     tags: ["git_tag"]
-    depends_on:
     commands:
       - func: "fetch source"
       - func: "run make target"
@@ -716,39 +753,16 @@ tasks:
           filenames:
             - "./src/github.com/mongodb/mongo-tools/mongodb-database-tools*"
 
-  - name: gosec-SARIF-report
-    tags: ["git_tag"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "run make target"
-        vars:
-          target: sa:installdevtools
-      - func: "generate gosec SARIF report"
-
-  - name: check-snyk-results
-    tags: ["git_tag"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - command: shell.exec
-        params:
-          working_dir: src/github.com/mongodb/mongo-tools
-          script: |
-            ${_set_shell_env}
-            set -e
-            curl -sSL -o ./snyk https://static.snyk.io/cli/latest/snyk-linux
-            chmod 0755 ./snyk
-            ./snyk test --org="${snyk_organization_id}" --file=./go.mod
-
   - name: check-augmented-sbom
     tags: ["git_tag"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "set silkbomb credentials"
       - command: shell.exec
         params:
           working_dir: src/github.com/mongodb/mongo-tools
+          include_expansions_in_env: [KONDUKTO_TOKEN]
           script: |
             ${_set_shell_env}
             ./scripts/regenerate-and-diff-augmented-sbom.sh
@@ -756,8 +770,6 @@ tasks:
   - name: release-json
     tags: ["git_tag"]
     depends_on:
-      - name: check-snyk-results
-        variant: "*"
       - name: push
         variant: "*"
     commands:
@@ -766,126 +778,10 @@ tasks:
       - func: "upload release json feed to s3"
 
   - name: generate-full-json
-    depends_on:
-      - name: check-snyk-results
-        variant: "*"
     commands:
       - func: "fetch source"
       - command: expansions.update
       - func: "generate full JSON feed"
-
-  - name: integration-3.6
-    tags: ["3.6"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "3.6"
-      - func: "start mongod"
-      - func: "wait for mongod to be ready"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:integration -ssl=true ${testArgs}
-
-  - name: integration-3.6-mmapv1
-    tags: ["3.6", "mmap"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "3.6"
-      - func: "start mongod"
-        vars:
-          STORAGE_ENGINE: "mmapv1"
-      - func: "wait for mongod to be ready"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:integration -ssl=true ${testArgs}
-
-  - name: integration-4.0
-    tags: ["4.0"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "4.0"
-      - func: "start mongod"
-      - func: "wait for mongod to be ready"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:integration -ssl=true ${testArgs}
-
-  - name: integration-4.0-auth
-    tags: ["4.0", "auth"]
-    commands:
-      - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args"
-              concat: " --auth"
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "4.0"
-      - func: "start mongod"
-      - func: "wait for mongod to be ready"
-      - func: "create mongod users"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:integration -ssl=true -auth=true ${testArgs}
-
-  - name: integration-4.0-cluster
-    tags: ["4.0", "cluster"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "4.0"
-      - func: "create repl_set"
-        vars:
-          USE_SSL: "true"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:integration -ssl=true ${testArgs}
-
-  - name: integration-4.0-mmapv1
-    tags: ["4.0", "mmap"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "4.0"
-      - func: "start mongod"
-        vars:
-          STORAGE_ENGINE: "mmapv1"
-      - func: "wait for mongod to be ready"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:integration -ssl=true ${testArgs}
 
   - name: integration-4.2
     tags: ["4.2"]
@@ -1361,6 +1257,186 @@ tasks:
         vars:
           target: test:awsauth ${testArgs}
 
+  - name: integration-8.1
+    tags: ["8.1"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.1.0"
+      - func: "start mongod"
+        vars:
+          USE_TLS: "true"
+      - func: "wait for mongod to be ready"
+        vars:
+          USE_TLS: "true"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:integration -ssl=true ${testArgs}
+
+  - name: integration-8.1-auth
+    tags: ["8.1", "auth"]
+    commands:
+      - func: "fetch source"
+      # Concat auth args
+      - command: expansions.update
+        params:
+          updates:
+            - key: "mongod_args_tls"
+              concat: " --auth"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.1.0"
+      - func: "start mongod"
+        vars:
+          USE_TLS: "true"
+      - func: "wait for mongod to be ready"
+        vars:
+          USE_TLS: "true"
+      - func: "create mongod users"
+        vars:
+          USE_TLS: "true"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:integration -ssl=true -auth=true ${testArgs}
+
+  - name: integration-8.1-cluster
+    tags: ["8.1", "cluster"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.1.0"
+      - func: "create repl_set"
+        vars:
+          USE_TLS: "true"
+          load_libs_version: "8.1"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:integration -ssl=true -topology=replSet ${testArgs}
+
+  - name: aws-auth-8.1
+    tags: ["8.1", "aws-auth"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "download mongod and shell"
+        vars:
+          edition: "enterprise"
+          mongo_version: "8.1.0"
+      - func: "start mongod"
+        vars:
+          AWS_AUTH: "true"
+      - func: "wait for mongod to be ready"
+        vars:
+          AWS_AUTH: "true"
+      - func: "add-aws-auth-variables-to-file"
+      - func: "setup-aws-auth-test-with-assume-role-credentials"
+      - func: "run make target"
+        vars:
+          target: test:awsauth ${testArgs}
+
+  - name: integration-8.2
+    tags: ["8.2"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.2.0-rc1"
+      - func: "start mongod"
+        vars:
+          USE_TLS: "true"
+      - func: "wait for mongod to be ready"
+        vars:
+          USE_TLS: "true"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:integration -ssl=true ${testArgs}
+
+  - name: integration-8.2-auth
+    tags: ["8.2", "auth"]
+    commands:
+      - func: "fetch source"
+      # Concat auth args
+      - command: expansions.update
+        params:
+          updates:
+            - key: "mongod_args_tls"
+              concat: " --auth"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.2.0"
+      - func: "start mongod"
+        vars:
+          USE_TLS: "true"
+      - func: "wait for mongod to be ready"
+        vars:
+          USE_TLS: "true"
+      - func: "create mongod users"
+        vars:
+          USE_TLS: "true"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:integration -ssl=true -auth=true ${testArgs}
+
+  - name: integration-8.2-cluster
+    tags: ["8.2", "cluster"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.2.0"
+      - func: "create repl_set"
+        vars:
+          USE_TLS: "true"
+          load_libs_version: "8.2"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:integration -ssl=true -topology=replSet ${testArgs}
+
+  - name: aws-auth-8.2
+    tags: ["8.2", "aws-auth"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "download mongod and shell"
+        vars:
+          edition: "enterprise"
+          mongo_version: "8.2.0"
+      - func: "start mongod"
+        vars:
+          AWS_AUTH: "true"
+      - func: "wait for mongod to be ready"
+        vars:
+          AWS_AUTH: "true"
+      - func: "add-aws-auth-variables-to-file"
+      - func: "setup-aws-auth-test-with-assume-role-credentials"
+      - func: "run make target"
+        vars:
+          target: test:awsauth ${testArgs}
+
   - name: integration-latest
     tags: ["latest"]
     commands:
@@ -1422,6 +1498,7 @@ tasks:
       - func: "create repl_set"
         vars:
           USE_TLS: "true"
+          load_libs_version: *max_server_version
       - func: "run make target"
         vars:
           target: build
@@ -1585,6 +1662,40 @@ tasks:
         vars:
           test_path: "test/legacy42"
 
+  - name: legacy-jstests-8.1 # The server jstests from the tools removal from server in 4.2
+    tags: ["8.1"]
+    commands:
+      - func: "fetch source"
+      - func: "get buildnumber"
+      - func: "setup credentials"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.1.0"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run legacy tests"
+        vars:
+          test_path: "test/legacy42"
+          load_libs_version: "8.1"
+
+  - name: legacy-jstests-8.2 # The server jstests from the tools removal from server in 4.2
+    tags: ["8.2"]
+    commands:
+      - func: "fetch source"
+      - func: "get buildnumber"
+      - func: "setup credentials"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.2.0"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run legacy tests"
+        vars:
+          test_path: "test/legacy42"
+          load_libs_version: "8.2"
+
   - name: legacy-jstests-latest # The server jstests from the tools removal from server in 4.2
     tags: ["latest"]
     commands:
@@ -1600,6 +1711,7 @@ tasks:
       - func: "run legacy tests"
         vars:
           test_path: "test/legacy42"
+          load_libs_version: *max_server_version
 
   - name: mod-tidy
     commands:
@@ -1701,6 +1813,40 @@ tasks:
           resmoke_suite: "core${resmoke_use_tls}"
           excludes: "requires_unstable,${excludes}"
 
+  - name: qa-tests-8.1
+    tags: ["8.1"]
+    commands:
+      - func: "fetch source"
+      - func: "get buildnumber"
+      - func: "setup credentials"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.1.0"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run qa-tests"
+        vars:
+          resmoke_suite: "core${resmoke_use_tls}"
+          excludes: "requires_unstable,${excludes}"
+
+  - name: qa-tests-8.2
+    tags: ["8.2"]
+    commands:
+      - func: "fetch source"
+      - func: "get buildnumber"
+      - func: "setup credentials"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.2.0"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run qa-tests"
+        vars:
+          resmoke_suite: "core${resmoke_use_tls}"
+          excludes: "requires_unstable,${excludes}"
+
   - name: qa-tests-latest
     tags: ["latest"]
     commands:
@@ -1751,40 +1897,6 @@ tasks:
         vars:
           resmoke_suite: "core${resmoke_use_tls}"
           excludes: "requires_unstable,${excludes}"
-
-  - name: qa-tests-4.0
-    tags: ["4.0"]
-    commands:
-      - func: "fetch source"
-      - func: "get buildnumber"
-      - func: "setup credentials"
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "4.0"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run qa-tests"
-        vars:
-          resmoke_suite: "core${resmoke_use_ssl}"
-          excludes: "requires_min_mongo_42,requires_unstable,${excludes}"
-
-  - name: qa-tests-3.6
-    tags: ["3.6"]
-    commands:
-      - func: "fetch source"
-      - func: "get buildnumber"
-      - func: "setup credentials"
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "3.6"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run qa-tests"
-        vars:
-          resmoke_suite: "core${resmoke_use_ssl}"
-          excludes: "requires_min_mongo_40,requires_min_mongo_42,requires_unstable,${excludes}"
 
   - name: native-cert-ssl-4.4
     tags: ["4.4"]
@@ -1879,6 +1991,14 @@ tasks:
       - func: "fetch source"
       - func: "check sbom lite"
 
+  - name: check-sarif-report
+    commands:
+      - func: "fetch source"
+      - func: "run make target"
+        vars:
+          target: sa:installdevtools
+      - func: "check sarif report"
+
 buildvariants:
   #######################################
   #     Static Analysis Buildvariant    #
@@ -1897,7 +2017,7 @@ buildvariants:
       - name: vet
       - name: check-third-party-notices
       - name: check-sbom-lite
-      - name: gosec-SARIF-report
+      - name: check-sarif-report
 
   #######################################
   #     Release Manager Buildvariant    #
@@ -1909,7 +2029,6 @@ buildvariants:
     run_on:
       - amazon1-2018-test
     tasks:
-      - name: check-snyk-results
       - name: check-augmented-sbom
         # podman is not available on the amazon distro.
         run_on: rhel87-small
@@ -1995,11 +2114,11 @@ buildvariants:
   #######################################
 
   - name: macos
-    display_name: MacOS 11.00 x86_64
+    display_name: MacOS 14 x86_64
     expansions:
       mongo_os: "osx"
     run_on:
-      - macos-1100
+      - macos-14
     tasks:
       - name: "dist"
       - name: "sign"
@@ -2011,11 +2130,11 @@ buildvariants:
   #######################################
 
   - name: macos-arm64
-    display_name: MacOS 11 ARM
+    display_name: MacOS 14 ARM
     expansions:
       mongo_os: "osx"
     run_on:
-      - macos-1100-arm64
+      - macos-14-arm64
     tasks:
       - name: "dist"
       - name: "sign"
@@ -2025,51 +2144,6 @@ buildvariants:
   #######################################
   #     RHEL x86_64 Buildvariants       #
   #######################################
-
-  - name: rhel62
-    display_name: RHEL 6.2
-    expansions:
-      mongo_os: "rhel62"
-    run_on:
-      - rhel62-small
-    tasks:
-      - name: "dist"
-      - name: "sign"
-        run_on: rhel87-small
-      - name: "push"
-        run_on: rhel80-small
-
-  # This build is specifically for Splunk
-  - name: rhel62-no-kerberos
-    display_name: "# RHEL 6.2 w/o Kerberos"
-    expansions:
-      <<:
-        [
-          *mongod_ssl_startup_args,
-          *mongo_ssl_startup_args,
-          *mongod_tls_startup_args,
-          *mongo_tls_startup_args,
-        ]
-      mongo_os: "rhel62"
-      mongo_edition: "enterprise"
-      smoke_use_ssl: --use-ssl
-      resmoke_use_ssl: _ssl
-      smoke_use_tls: --use-tls
-      resmoke_use_tls: _tls
-      edition: enterprise
-      run_kinit: true
-      resmoke_args: --jobs 4
-    run_on:
-      - rhel62-small
-    tasks:
-      - name: "unit"
-      - name: ".3.6"
-      - name: ".4.0"
-      - name: "dist"
-      - name: "sign"
-        run_on: rhel87-small
-    # We intentionally do not invoke the push task. We want to upload these
-    # binaries to S3, but we do not add them to the release feed or RPM repos.
 
   - name: rhel70
     display_name: RHEL 7.0
@@ -2084,6 +2158,7 @@ buildvariants:
 
   - name: rhel88
     display_name: "# RHEL 8.8"
+    cron: 0 3 * * *
     run_on:
       - rhel8.8-large
     expansions:
@@ -2096,22 +2171,20 @@ buildvariants:
         ]
       mongo_os: "rhel80"
       mongo_edition: "enterprise"
-      smoke_use_ssl: --use-ssl
-      resmoke_use_ssl: _ssl
-      smoke_use_tls: --use-tls
       resmoke_use_tls: _tls
       edition: enterprise
       run_kinit: true
       resmoke_args: --jobs 4
     tasks:
       - name: "unit"
-      - name: ".4.0"
       - name: ".4.2"
       - name: ".4.4"
       - name: ".5.0"
       - name: ".6.0"
       - name: ".7.0"
       - name: ".8.0"
+      - name: ".8.1"
+      - name: ".8.2"
       - name: ".latest"
       - name: ".kerberos"
       - name: "dist"
@@ -2135,22 +2208,20 @@ buildvariants:
       mongo_os: "rhel80"
       mongo_edition: "enterprise"
       testArgs: "-race=true"
-      smoke_use_ssl: --use-ssl
-      resmoke_use_ssl: _ssl
-      smoke_use_tls: --use-tls
       resmoke_use_tls: _tls
       edition: enterprise
       run_kinit: true
       resmoke_args: --jobs 4
     tasks:
       - name: "unit"
-      - name: ".4.0"
       - name: ".4.2"
       - name: ".4.4"
       - name: ".5.0"
       - name: ".6.0"
       - name: ".7.0"
       - name: ".8.0"
+      - name: ".8.1"
+      - name: ".8.2"
       - name: ".latest"
       - name: ".kerberos"
 
@@ -2282,10 +2353,7 @@ buildvariants:
       mongo_os: "windows-64"
       mongo_edition: "enterprise"
       mongo_target: "windows"
-      smoke_use_ssl: --use-ssl
       resmoke_args: --jobs 4
-      resmoke_use_ssl: _ssl
-      smoke_use_tls: --use-tls
       resmoke_use_tls: _tls
       excludes: requires_large_ram,requires_mongo_24
       edition: enterprise
@@ -2294,13 +2362,14 @@ buildvariants:
       USE_SSL: "true"
     tasks:
       - name: "unit"
-      - name: ".4.0"
       - name: ".4.2"
       - name: ".4.4"
       - name: ".5.0"
       - name: ".6.0"
       - name: ".7.0"
       - name: ".8.0"
+      - name: ".8.1"
+      - name: ".8.2"
       - name: ".latest"
       - name: ".kerberos"
       - name: "dist"
@@ -2449,6 +2518,18 @@ buildvariants:
       - name: "push"
         run_on: rhel80-small
 
+  - name: rhel9-ppc64le
+    display_name: ZAP PPC64LE RHEL 9
+    run_on:
+      - rhel9-power-small
+    stepback: false
+    tasks:
+      - name: "dist"
+      - name: "sign"
+        run_on: rhel87-small
+      - name: "push"
+        run_on: rhel80-small
+
   #######################################
   #     Z (s390x) Buildvariants         #
   #######################################
@@ -2477,6 +2558,18 @@ buildvariants:
       - name: "push"
         run_on: rhel80-small
 
+  - name: rhel9-s390x
+    display_name: ZAP s390x RHEL 9
+    run_on:
+      - rhel9-zseries-small
+    stepback: false
+    tasks:
+      - name: "dist"
+      - name: "sign"
+        run_on: rhel87-small
+      - name: "push"
+        run_on: rhel80-small
+
 # This set of aliases is generated by the code in the `evergreen` directory.
 # Do not edit this by hand!
 # It can be regenerated by running `go run evergreen/generator/main.go`.
@@ -2497,10 +2590,6 @@ github_pr_aliases:
   # a relatively recent platform that supports a wide range of servers.
   - variant: "^rhel88$"
     task: "^(aws-auth|integration|kerberos|legacy|native-cert-ssl|qa-dump-restore|qa-tests)"
-  # Run a subset of integration tests against the 3.6 version of MongoDB
-  # Server on all variants where that is the most recent supported version.
-  - variant: "^rhel62-no-kerberos$"
-    task: "integration-3.6"
   # Run a subset of integration tests against the latest version of MongoDB
   # Server on all variants where that is the most recent supported version.
   - variant: "^(rhel88|windows)$"

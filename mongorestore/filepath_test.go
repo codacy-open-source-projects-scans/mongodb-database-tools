@@ -321,8 +321,8 @@ func TestHandlingBSON(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			Convey("the proper DB and Coll should be inferred", func() {
-				So(mr.ToolOptions.Namespace.DB, ShouldEqual, "db1")
-				So(mr.ToolOptions.Namespace.Collection, ShouldEqual, "c2")
+				So(mr.ToolOptions.DB, ShouldEqual, "db1")
+				So(mr.ToolOptions.Collection, ShouldEqual, "c2")
 			})
 		})
 
@@ -333,27 +333,27 @@ func TestHandlingBSON(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			Convey("the proper DB and Coll should be inferred", func() {
-				So(mr.ToolOptions.Namespace.DB, ShouldEqual, "db1")
-				So(mr.ToolOptions.Namespace.Collection, ShouldEqual, longCollectionName)
+				So(mr.ToolOptions.DB, ShouldEqual, "db1")
+				So(mr.ToolOptions.Collection, ShouldEqual, longCollectionName)
 			})
 		})
 
 		Convey("but pre-existing settings should not be overwritten", func() {
-			mr.ToolOptions.Namespace.DB = "a"
+			mr.ToolOptions.DB = "a"
 
 			Convey("either collection settings", func() {
-				mr.ToolOptions.Namespace.Collection = "b"
+				mr.ToolOptions.Collection = "b"
 				err := mr.handleBSONInsteadOfDirectory("testdata/testdirs/db1/c1.bson")
 				So(err, ShouldBeNil)
-				So(mr.ToolOptions.Namespace.DB, ShouldEqual, "a")
-				So(mr.ToolOptions.Namespace.Collection, ShouldEqual, "b")
+				So(mr.ToolOptions.DB, ShouldEqual, "a")
+				So(mr.ToolOptions.Collection, ShouldEqual, "b")
 			})
 
 			Convey("or db settings", func() {
 				err := mr.handleBSONInsteadOfDirectory("testdata/testdirs/db1/c1.bson")
 				So(err, ShouldBeNil)
-				So(mr.ToolOptions.Namespace.DB, ShouldEqual, "a")
-				So(mr.ToolOptions.Namespace.Collection, ShouldEqual, "c1")
+				So(mr.ToolOptions.DB, ShouldEqual, "a")
+				So(mr.ToolOptions.Collection, ShouldEqual, "c1")
 			})
 		})
 	})
@@ -457,6 +457,98 @@ func TestCreateIntentsForCollection(t *testing.T) {
 			})
 		})
 
+	})
+}
+
+func TestCreateIntentForCollectionTimeSeries(t *testing.T) {
+	var mr *MongoRestore
+	var buff bytes.Buffer
+
+	testtype.SkipUnlessTestType(t, testtype.UnitTestType)
+	Convey("With a test MongoRestore", t, func() {
+		buff = bytes.Buffer{}
+		mr = &MongoRestore{
+			manager:      intents.NewIntentManager(),
+			ToolOptions:  &commonOpts.ToolOptions{},
+			InputOptions: &InputOptions{},
+		}
+		log.SetWriter(&buff)
+
+		Convey(
+			"running CreateIntentForCollection on a system.buckets file *with* metadata",
+			func() {
+				ddl, err := newActualPath(
+					util.ToUniversalPath(
+						"testdata/timeseries_tests/ts_dump/timeseries_test/system.buckets.foo_ts.bson",
+					),
+				)
+				So(err, ShouldBeNil)
+				mr.ToolOptions.Namespace = &commonOpts.Namespace{}
+
+				err = mr.handleBSONInsteadOfDirectory(ddl.Path())
+				So(err, ShouldBeNil)
+				So(mr.ToolOptions.DB, ShouldEqual, "timeseries_test")
+				So(mr.ToolOptions.Collection, ShouldEqual, "system.buckets.foo_ts")
+
+				Convey("should create one intent with inferred fields from BSON name", func() {
+					err = mr.CreateIntentForCollection(
+						mr.ToolOptions.DB,
+						mr.ToolOptions.Collection,
+						ddl,
+					)
+					mr.manager.Finalize(intents.Legacy)
+					So(err, ShouldBeNil)
+
+					i0 := mr.manager.Pop()
+					So(i0, ShouldNotBeNil)
+					So(i0.DB, ShouldEqual, mr.ToolOptions.DB)
+					So(i0.C, ShouldEqual, "foo_ts")
+					So(i0.Location, ShouldEqual, util.ToUniversalPath(ddl.Path()))
+					i1 := mr.manager.Pop()
+					So(i1, ShouldBeNil)
+
+					Convey("and a set Metadata path", func() {
+						So(
+							i0.MetadataLocation,
+							ShouldEqual,
+							util.ToUniversalPath(
+								"testdata/timeseries_tests/ts_dump/timeseries_test/foo_ts.metadata.json",
+							),
+						)
+						logs := buff.String()
+						So(strings.Contains(logs, "found metadata"), ShouldEqual, true)
+					})
+				})
+
+				Convey(
+					"should create an intent correctly when input db and collection params contain 'system.buckets.' prefix",
+					func() {
+						err = mr.CreateIntentForCollection("myDB", "system.buckets.myC", ddl)
+						mr.manager.Finalize(intents.Legacy)
+						So(err, ShouldBeNil)
+						i0 := mr.manager.Pop()
+						So(i0, ShouldNotBeNil)
+						So(i0.DB, ShouldEqual, "myDB")
+						So(i0.C, ShouldEqual, "myC")
+						So(i0.Location, ShouldEqual, ddl.Path())
+						i1 := mr.manager.Pop()
+						So(i1, ShouldBeNil)
+
+						Convey("and a set Metadata path", func() {
+							So(
+								i0.MetadataLocation,
+								ShouldEqual,
+								util.ToUniversalPath(
+									"testdata/timeseries_tests/ts_dump/timeseries_test/foo_ts.metadata.json",
+								),
+							)
+							logs := buff.String()
+							So(strings.Contains(logs, "found metadata"), ShouldEqual, true)
+						})
+					},
+				)
+			},
+		)
 	})
 }
 

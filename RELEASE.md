@@ -45,16 +45,25 @@ Complete these tasks before tagging a new release.
 Move the JIRA ticket for the release to the "In Progress" state. Ensure that its fixVersion matches
 the version being released.
 
-#### Check for Outstanding Vulnerabilities in Dependencies in Silk
+#### Check for Outstanding Vulnerabilities in Dependencies
 
-You can view open findings on
-[the Silk dashboard for this project](https://us1.app.silk.security/inventory/code-repositories?assetId=mongodb____DedupedCodeAsset____dd18b99bbdf5e991fa452636302d07dd04bb48bd&assets-filters=%5B%7B%22filterCriteria%22%3A%22is%22%2C%22filterField%22%3A%22ignored_info.ignored%22%2C%22filterString%22%3A%5B%22false%22%5D%2C%22filterType%22%3A%22boolean%22%7D%2C%7B%22filterCriteria%22%3A%22is%22%2C%22filterField%22%3A%22project_name%22%2C%22filterString%22%3A%5B%22mongodb%2Fmongo-tools%22%5D%2C%22filterType%22%3A%22string%22%7D%5D&assets-page=1).
+See [our internal wiki](https://wiki.corp.mongodb.com/pages/viewpage.action?pageId=276642867) for
+more details on how we handle third-party vulnerabilities, in particular
+[our vulnerability issue lifecycle](https://wiki.corp.mongodb.com/pages/viewpage.action?pageId=285096119).
 
-We have an SLA for releasing an updated version of the Database Tools to address _applicable_
-vulnerabilities in dependencies, based on the issue's severity. It's possible that a vulnerability
-is not applicable because the Database Tools code does not use the code path that leads to the
-vulnerability. This timeline **starts when the upstream fix is available, not when the issue is
-discovered**. The timeline for each severity level is as follows:
+We want to make sure that we have taken action on all reported vulnerabities in third-party
+dependencies before release. To find these, we should look for
+[TOOLS tickets linked to VULN tickets](<https://jira.mongodb.org/issues/?jql=project%20%3D%20TOOLS%20and%20issue%20in%20linkedTo(%22project%20%3D%20VULN%22)>).
+
+Ideally, all of these tickets should have the "Remediation Pending Release" status. However, in some
+cases, there may not be a version of the dependency available that addresses the vulnerability. In
+that case, it's okay to do a release with the vulnerability still present in the dependency we use.
+
+We have an informal SLA for releasing an updated version of the Database Tools to address
+_applicable_ vulnerabilities in dependencies, based on the issue's severity. It's possible that a
+vulnerability is not applicable because the Database Tools code does not use the code path that
+leads to the vulnerability. This timeline **starts when the upstream fix is available, not when the
+issue is discovered**. The timeline for each severity level is as follows:
 
 - Critical or High severity - 30 days
 - Medium - 90 days
@@ -66,35 +75,30 @@ Critical severity levels, even if this would not violate our SLA.
 If possible, we would like to avoid releasing with known, applicable issues at the Medium severity
 level, but these can be deferred at the team's discretion.
 
-Sometimes Silk will report findings that are not actual vulnerabilities. If you are confident this
-is the case, you can click on an individual finding, then click on the "Ignore" button. This will
-prompt you for the ignore reason. Pick the appropriate one and add a comment explaining why this is
-the case. If you're not sure if a finding is a false positive, discuss it with the team in Slack.
-
 #### Create the Augmented SBOM File for the Upcoming Release
 
-You can generate this by running `go run build.go writeAugmentedSBOM`. This requires several
-environment variables to be set:
+You can generate this by running `go run build.go writeAugmentedSBOM`. Make sure to pull the latest
+changes from master before running this command. This requires several environment variables to be
+set:
 
-- `SILK_CLIENT_ID` - available from 1Password.
-- `SILK_CLIENT_SECRET` - available from 1Password.
+- `KONDUKTO_TOKEN` - available from 1Password.
 - `EVG_TRIGGERED_BY_TAG` - the _next_ version that you are preparing to release.
 
 ```
-SILK_CLIENT_ID="$client_id"\
-    SILK_CLIENT_SECRET="$clent_secret" \
+KONDUKTO_TOKEN="$kondukto_token"\
     EVG_TRIGGERED_BY_TAG=100.9.5 \
     go run build.go writeAugmentedSBOM
 ```
 
-The Silk credentials are shared with our team via 1Password.
+The Kondukto credentials are shared with our team via 1Password.
 
-**Note that if there have been recent changes to this project's dependencies, these may not be
-reflected in the Augmented SBOM.** That's because new dependencies are only processed once per day.
-These are _first_ processed by Snyk based on the SBOM Lite file, `cyclonedx.sbom.json`. Then another
-service, Silk, ingests this file from Snyk and adds vulnerability information to it. That means it
-can take up to 48 hours before changes to our dependencies are reflected in the generated Augmented
-SBOM.
+To test, the check-augmented-sbom Evergreen task can be run locally with
+
+```
+KONDUKTO_TOKEN="$kondukto_token"\
+    EVG_TRIGGERED_BY_TAG=100.9.5 \
+    scripts/regenerate-and-diff-augmented-sbom.sh
+```
 
 If there are recently fixed third-party vulnerabilities, make sure that these are reflected in the
 Augmented SBOM before the release.
@@ -102,7 +106,16 @@ Augmented SBOM before the release.
 See our [documentation on contributing](./CONTRIBUTING.md) for more details on how we handle
 dependency scanning and vulnerabilities.
 
-#### Ensure All Static Dependency Checks Pass
+You must commit this file before you can do a release.
+
+#### Create the SARIF Report File for the Upcoming Release
+
+You can do this by copying the `SARIF.json` file in the repo root to a filename like
+`ssdlc/100.12.2.sarif.json`, replacing `100.12.2` with the tag for this release.
+
+You must commit this file before you can do a release.
+
+#### Ensure All Static Analysis Checks Pass
 
 The easiest way to do this is to run our linting, which includes `gosec`:
 
@@ -130,7 +143,8 @@ If you are releasing a patch version but a ticket needs a minor bump, update the
 minor version bump. If you are releasing a patch or minor version but a ticket needs a major bump,
 stop the release process immediately.
 
-The only uncompleted ticket in the release should be the release ticket. If there are any remaining
+The only uncompleted tickets in the release should be the release ticket and third-party
+vulnerability tickets in the "Remediation Pending Release" status. If there are any remaining
 tickets that will not be included in this release, remove the fixVersion and assign them a new one
 if appropriate.
 
@@ -180,6 +194,23 @@ Some evergreen variants (particularly zSeries and PowerPC variants) may have a l
 To speed up release tasks, you can set the task priority for any variant to 70 for release
 candidates and 99 for actual releases.
 
+#### Handling Release Task Failures
+
+Sometimes you may start the release process only to discover that some tasks that are part of the
+release, like `push`, fail. If the fix for these failures is to make changes in the repo, you need
+to partially restart the release process. Here are the steps to follow:
+
+1. Cancel the tasks still running for the release in Evergreen.
+2. Fix the issue in the repo and merge the fix to master.
+3. Delete the task from the `origin` remote (GitHub):
+   ```
+   $> git push origin --delete 100.5.4
+   ```
+4. Make a new tag and push it as you do for the normal release process.
+
+Evergreen should kick off a new set of tasks for the release. Then you can continue the normal
+release process from there.
+
 ### Post-Release Tasks
 
 Complete these tasks after the release builds have completed on evergreen.
@@ -195,7 +226,7 @@ new release is available there. Download the package for your OS and confirm tha
 In order to make the latest release available via our Homebrew tap, submit a pull request to
 [mongodb/homebrew-brew](https://github.com/mongodb/homebrew-brew/blob/bb5b57095a892daeb2700f1a9440550f8e87505b/Formula/mongodb-database-tools.rb#L7-L13)
 for both `x86` and `arm64`. You can get the sha256 sum locally using
-`shasum -a 256 <tools zip file>`.
+`shasum -a 256 <tools zip file>`. Add 10gen/devprod-correctness as a reviewer or tag them in the PR.
 
 #### Update the changelog
 
@@ -232,9 +263,8 @@ Bugs and feature requests can be reported in the [Database Tools Jira](https://j
   bugfix etc.). Make sure that all tickets marked as `Mongo Internal` for their "Security Level"
   field are excluded from the release notes, _except_ for tickets created for third-party
   vulnerabilities. These vulnerability tickets will be linked to a corresponding ticket in the
-  internal-only "VULN" Jira project. Change the "Security Level" to None for any closed
-  vulnerability tickets in the TOOLS project so that they're public. Also make sure there is nothing
-  in the list that might have been tagged with the wrong fix version.
+  internal-only "VULN" Jira project.
+- Make sure there is nothing in the list that might have been tagged with the wrong fix version.
 - Copy the HTML list of tickets from JIRA and paste it in CHANGELOG.md in place of
   `<INSERT-LIST-OF-TICKETS>`.
 - Remove the top line of the list of tickets that says
@@ -282,33 +312,12 @@ automatically transitioned to "Remediation Complete" when the release is marked 
 can confirm this by searching for tickets in these two states and making sure that they have the
 expected status.
 
+VULN-linked tickets related to third party vulnerabilites should also have been updated
+automatically to set the "Security Level" to None once the Fix Version is marked as Released.
+
 #### Announce the release
 
 Copy your entry from CHANGELOG.md and post it to the
 [MongoDB Community Forums](https://developer.mongodb.com/community/forums/tags/c/developer-tools/49/database-tools)
 in the "Developer Tools" section with the tag `database-tools`. Also post it in the #mongo-tools
 slack channel to announce it internally.
-
-#### Create a New SSDLC Compliance Report for the Release
-
-The report template is at `ssdlc/ssdlc-compliance-report-template.md`. Copy this to a new file
-containing the tag that was released. The name should follow the pattern of
-`ssdlc-compliance-report.$tag.md`. There are various variables in this template. Search for `$` to
-find them. Replace them with the correct values as appropriate.
-
-### Handling Release Task Failures
-
-Sometimes you may start the release process only to discover that some tasks that are part of the
-release, like `push`, fail. If the fix for these failures is to make changes in the repo, you need
-to partially restart the release process. Here are the steps to follow:
-
-1. Cancel the tasks still running for the release in Evergreen.
-2. Fix the issue in the repo and merge the fix to master.
-3. Delete the task from the `origin` remote (GitHub):
-   ```
-   $> git push origin --delete 100.5.4
-   ```
-4. Make a new tag and push it as you do for the normal release process.
-
-Evergreen should kick off a new set of tasks for the release. Then you can continue the normal
-release process from there.

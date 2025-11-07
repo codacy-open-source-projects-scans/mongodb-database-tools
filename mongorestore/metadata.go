@@ -173,7 +173,17 @@ func (restore *MongoRestore) CreateIndexes(
 						"namespace is too long (max size is 127 bytes)", fullIndexName)
 			}
 		}
-		indexNames = append(indexNames, index.Options["name"].(string))
+
+		nameStr, isString := index.Options["name"].(string)
+		if !isString {
+			return fmt.Errorf(
+				"expected name (%T: %v) to be a string",
+				index.Options["name"],
+				index.Options["name"],
+			)
+		}
+
+		indexNames = append(indexNames, nameStr)
 
 		// remove the index version, forcing an update,
 		// unless we specifically want to keep it
@@ -264,19 +274,29 @@ func (restore *MongoRestore) CreateCollection(
 
 // UpdateAutoIndexId updates {autoIndexId: false} to {autoIndexId: true} if the server version is
 // >= 4.0 and the database is not `local`.
-func (restore *MongoRestore) UpdateAutoIndexId(options bson.D) {
+func (restore *MongoRestore) UpdateAutoIndexId(options bson.D) bson.D {
 	if restore.serverVersion.GTE(db.Version{4, 0, 0}) {
 		for i, elem := range options {
-			if elem.Key == "autoIndexId" && elem.Value == false &&
-				restore.ToolOptions.Namespace.DB != "local" {
-				options[i].Value = true
-				log.Logvf(
-					log.Always,
-					"{autoIndexId: false} is not allowed in server versions >= 4.0. Changing to {autoIndexId: true}.",
-				)
+			if elem.Key == "autoIndexId" {
+				if restore.serverVersion.GTE(db.Version{8, 2, 0}) {
+					options = append(options[:i], options[i+1:]...)
+					log.Logvf(
+						log.Always,
+						"autoIndexId is not allowed in server versions >= 8.2.0. Removing.",
+					)
+				} else if elem.Value == false &&
+					restore.ToolOptions.DB != "local" {
+					options[i].Value = true
+					log.Logvf(
+						log.Always,
+						"{autoIndexId: false} is not allowed in server versions >= 4.0. Changing to {autoIndexId: true}.",
+					)
+				}
 			}
 		}
 	}
+
+	return options
 }
 
 func (restore *MongoRestore) createCollectionWithCommand(
@@ -284,7 +304,7 @@ func (restore *MongoRestore) createCollectionWithCommand(
 	intent *intents.Intent,
 	options bson.D,
 ) error {
-	restore.UpdateAutoIndexId(options)
+	options = restore.UpdateAutoIndexId(options)
 
 	command := createCollectionCommand(intent, options)
 
@@ -311,7 +331,7 @@ func (restore *MongoRestore) createCollectionWithApplyOps(
 	options bson.D,
 	uuidHex string,
 ) error {
-	restore.UpdateAutoIndexId(options)
+	options = restore.UpdateAutoIndexId(options)
 
 	command := createCollectionCommand(intent, options)
 	uuid, err := hex.DecodeString(uuidHex)
@@ -559,6 +579,17 @@ func (restore *MongoRestore) RestoreUsersOrRoles(users, roles *intents.Intent) e
 // present in the dump, we try to infer the authentication version based on its absence.
 // Returns the authentication version number and any errors that occur.
 func (restore *MongoRestore) GetDumpAuthVersion() (int, error) {
+	// authSchema doc has been removed from system.version from 8.1+ (SERVER-83663)
+	// The only auth version used by server 8.1+ is 5
+	if restore.dumpServerVersion.GTE(db.Version{8, 1, 0}) {
+		log.Logvf(
+			log.DebugLow,
+			"skipping authSchema check for server version %v",
+			restore.dumpServerVersion,
+		)
+		return 5, nil
+	}
+
 	// first handle the case where we have no auth version
 	intent := restore.manager.AuthVersion()
 	if intent == nil {
@@ -569,7 +600,7 @@ func (restore *MongoRestore) GetDumpAuthVersion() (int, error) {
 			log.Logvf(
 				log.Always,
 				"no system.version bson file found in '%v' database dump",
-				restore.ToolOptions.Namespace.DB,
+				restore.ToolOptions.DB,
 			)
 			log.Logv(
 				log.Always,
@@ -692,8 +723,8 @@ func (restore *MongoRestore) ShouldRestoreUsersAndRoles() bool {
 	// then we check if users or roles BSON files actually exist in the dump
 	// dir. If they do, return true.
 	if (restore.InputOptions.RestoreDBUsersAndRoles ||
-		restore.ToolOptions.Namespace.DB == "" ||
-		restore.ToolOptions.Namespace.DB == "admin") &&
+		restore.ToolOptions.DB == "" ||
+		restore.ToolOptions.DB == "admin") &&
 		!restore.isAtlasProxy {
 		if restore.manager.Users() != nil || restore.manager.Roles() != nil {
 			return true

@@ -112,7 +112,7 @@ func New(opts Options) (*MongoExport, error) {
 		return nil, util.SetupError{Err: err}
 	}
 
-	log.Logvf(log.Always, "connected to: %v", util.SanitizeURI(opts.URI.ConnectionString))
+	log.Logvf(log.Always, "connected to: %v", util.SanitizeURI(opts.ConnectionString))
 
 	isMongos, err := provider.IsMongos()
 	if err != nil {
@@ -152,18 +152,18 @@ func (exp *MongoExport) Close() {
 func (exp *MongoExport) validateSettings() error {
 	// Namespace must have a valid database if none is specified,
 	// use 'test'
-	if exp.ToolOptions.Namespace.DB == "" {
-		exp.ToolOptions.Namespace.DB = "test"
+	if exp.ToolOptions.DB == "" {
+		exp.ToolOptions.DB = "test"
 	}
-	err := util.ValidateDBName(exp.ToolOptions.Namespace.DB)
+	err := util.ValidateDBName(exp.ToolOptions.DB)
 	if err != nil {
 		return err
 	}
 
-	if exp.ToolOptions.Namespace.Collection == "" {
+	if exp.ToolOptions.Collection == "" {
 		return fmt.Errorf("must specify a collection")
 	}
-	if err = util.ValidateCollectionGrammar(exp.ToolOptions.Namespace.Collection); err != nil {
+	if err = util.ValidateCollectionGrammar(exp.ToolOptions.Collection); err != nil {
 		return err
 	}
 
@@ -279,7 +279,7 @@ func (exp *MongoExport) getCount() (int64, error) {
 		return 0, nil
 	}
 	coll := session.Database(exp.ToolOptions.Namespace.DB).
-		Collection(exp.ToolOptions.Namespace.Collection)
+		Collection(exp.ToolOptions.Collection)
 
 	if exp.collInfo.IsView() {
 		return 0, nil
@@ -288,8 +288,8 @@ func (exp *MongoExport) getCount() (int64, error) {
 	log.Logvf(
 		log.DebugHigh,
 		"Getting estimated count for %v.%v",
-		exp.ToolOptions.Namespace.DB,
-		exp.ToolOptions.Namespace.Collection,
+		exp.ToolOptions.DB,
+		exp.ToolOptions.Collection,
 	)
 	c, err := coll.EstimatedDocumentCount(context.TODO())
 	if err != nil {
@@ -340,39 +340,10 @@ func (exp *MongoExport) getCursor() (*mongo.Cursor, error) {
 	if err != nil {
 		return nil, err
 	}
-	intendedDB := session.Database(exp.ToolOptions.Namespace.DB)
-	isMMAPV1, err := db.IsMMAPV1(intendedDB, exp.ToolOptions.Namespace.Collection)
-	if err != nil {
-		// if we failed to determine storage engine, there is a good change it is because this
-		// collection is a view. We only want to warn if this collection is not a view, since
-		// storage engine does not affect consistency for scans of views.
-		collection := intendedDB.Collection(exp.ToolOptions.Namespace.Collection)
-		collectionInfo, err := db.GetCollectionInfo(collection)
-		if err != nil || !collectionInfo.IsView() {
-			log.Logvf(log.Always,
-				"failed to determine storage engine, an mmapv1 storage engine could"+
-					" result in inconsistent export results, error was: %v", err)
-		}
-	}
-	// shouldHintId is true iff the storage engine is MMAPV1 and the user did not specify
-	// --forceTableScan.
-	shouldHintId := isMMAPV1 && (exp.InputOpts == nil || !exp.InputOpts.ForceTableScan)
+	intendedDB := session.Database(exp.ToolOptions.DB)
+
 	// noSorting is true if the user did not ask for sorting.
-	noSorting := exp.InputOpts == nil || exp.InputOpts.Sort == ""
-	coll := intendedDB.Collection(exp.ToolOptions.Namespace.Collection)
-
-	// we want to hint _id if shouldHintId is true, and there is no query, and
-	// there is no sorting, as hinting is not needed if there is a query or sorting.
-	// we also do not want to hint for system collections or views.
-	if shouldHintId && len(query) == 0 && noSorting &&
-		!exp.collInfo.IsView() && !exp.collInfo.IsSystemCollection() {
-
-		// Don't hint autoIndexId:false collections
-		autoIndexId, err := bsonutil.FindValueByKey("autoIndexId", &exp.collInfo.Options)
-		if err != nil || autoIndexId == true {
-			findOpts.SetHint(bson.D{{"_id", 1}})
-		}
-	}
+	coll := intendedDB.Collection(exp.ToolOptions.Collection)
 
 	if exp.InputOpts != nil {
 		findOpts.SetSkip(exp.InputOpts.Skip)
@@ -397,7 +368,7 @@ func (exp *MongoExport) verifyCollectionExists() (bool, error) {
 	}
 
 	coll := session.Database(exp.ToolOptions.Namespace.DB).
-		Collection(exp.ToolOptions.Namespace.Collection)
+		Collection(exp.ToolOptions.Collection)
 	exp.collInfo, err = db.GetCollectionInfo(coll)
 	if err != nil {
 		return false, err
@@ -409,7 +380,7 @@ func (exp *MongoExport) verifyCollectionExists() (bool, error) {
 		if exp.InputOpts.AssertExists {
 			collInfoErr = fmt.Errorf(
 				"collection '%s' does not exist",
-				exp.ToolOptions.Namespace.Collection,
+				exp.ToolOptions.Collection,
 			)
 		}
 
@@ -437,8 +408,8 @@ func (exp *MongoExport) exportInternal(out io.Writer) (int64, error) {
 	if exp.ProgressManager != nil {
 		name := fmt.Sprintf(
 			"%v.%v",
-			exp.ToolOptions.Namespace.DB,
-			exp.ToolOptions.Namespace.Collection,
+			exp.ToolOptions.DB,
+			exp.ToolOptions.Collection,
 		)
 		exp.ProgressManager.Attach(name, watchProgressor)
 		defer exp.ProgressManager.Detach(name)

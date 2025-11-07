@@ -19,11 +19,13 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/mongodb/mongo-tools/release/aws"
 	"github.com/mongodb/mongo-tools/release/download"
 	"github.com/mongodb/mongo-tools/release/env"
@@ -79,7 +81,7 @@ func main() {
 				Action: func(cCtx *cli.Context) error {
 					v, err := version.GetCurrent()
 					if err != nil {
-						return fmt.Errorf("Failed to get current version: %v", err)
+						return fmt.Errorf("Failed to get current version: %w", err)
 					}
 					fmt.Println(v.StringWithCommit())
 					return nil
@@ -148,6 +150,22 @@ func main() {
 					},
 				},
 			},
+			{
+				Name: "print-binary-paths",
+				Action: func(cCtx *cli.Context) error {
+					for _, b := range binaries {
+						fmt.Printf("./%s\n", b)
+					}
+					return nil
+				},
+			},
+			{
+				Name: "print-os-arch-combos",
+				Action: func(cCtx *cli.Context) error {
+					printOsArchCombos()
+					return nil
+				},
+			},
 		},
 	}
 
@@ -157,16 +175,21 @@ func main() {
 
 }
 
-func check(err error, format ...interface{}) {
+func check(err error, format ...any) {
 	if err == nil {
 		return
 	}
 	msg := err.Error()
 	if len(format) != 0 {
-		task := fmt.Sprintf(format[0].(string), format[1:]...)
+		formatStr, ok := format[0].(string)
+		if !ok {
+			log.Fatalf("format should be a string, not %T", format[0])
+		}
+
+		task := fmt.Sprintf(formatStr, format[1:]...)
 		msg = fmt.Sprintf("'%s' failed: %v", task, err)
 	}
-	log.Fatal(msg)
+	log.Panic(msg)
 }
 
 func run(name string, args ...string) (string, error) {
@@ -429,12 +452,14 @@ func buildRPM() {
 		contentBytes, err := os.ReadFile(filepath.Join("..", "installer", "rpm", specFile))
 		content := string(contentBytes)
 		check(err, "reading spec file content")
-		content = strings.Replace(content, "@TOOLS_VERSION@", rpmVersion, -1)
-		content = strings.Replace(content, "@TOOLS_RELEASE@", rpmRelease, -1)
+		content = strings.ReplaceAll(content, "@TOOLS_VERSION@", rpmVersion)
+		content = strings.ReplaceAll(content, "@TOOLS_RELEASE@", rpmRelease)
 		static := getStaticFiles("..", rpmFilename)
-		bomFilename := filepath.Base(static[len(static)-1])
-		content = strings.Replace(content, "@TOOLS_BOM_FILE@", bomFilename, -1)
-		content = strings.Replace(content, "@ARCHITECTURE@", pf.RPMArch(), -1)
+		bomFilename := filepath.Base(static[len(static)-2])
+		sarifFilename := filepath.Base(static[len(static)-1])
+		content = strings.ReplaceAll(content, "@TOOLS_BOM_FILE@", bomFilename)
+		content = strings.ReplaceAll(content, "@TOOLS_SARIF_FILE@", sarifFilename)
+		content = strings.ReplaceAll(content, "@ARCHITECTURE@", pf.RPMArch())
 		_, err = f.WriteString(content)
 		check(err, "write content to spec file")
 	}
@@ -540,7 +565,7 @@ func buildDeb() {
 		contentBytes, err := os.ReadFile(filepath.Join("..", "installer", "deb", "control"))
 		content := string(contentBytes)
 		check(err, "reading control file content")
-		content = strings.Replace(content, "@TOOLS_VERSION@", v.String(), -1)
+		content = strings.ReplaceAll(content, "@TOOLS_VERSION@", v.String())
 
 		content = strings.Replace(content, "@ARCHITECTURE@", pf.DebianArch(), 1)
 		_, err = f.WriteString(content)
@@ -646,8 +671,9 @@ func buildMSI() {
 		"THIRD-PARTY-NOTICES",
 	}
 	static := getStaticFiles(".", msiFilename)
-	augmentedSBOMFilename := static[len(static)-1]
-	msiStaticFiles = append(msiStaticFiles, augmentedSBOMFilename)
+	augmentedSBOMFilename := static[len(static)-2]
+	sarifReportFilename := static[len(static)-1]
+	msiStaticFiles = append(msiStaticFiles, augmentedSBOMFilename, sarifReportFilename)
 
 	// location of the necessary data files to build the msi.
 	var msiFiles = []string{
@@ -735,6 +761,7 @@ func buildMSI() {
 		`-dVersionLabel=`+versionLabel,
 		`-dProjectName=`+projectName,
 		`-dAugmentedSBOMFilename=`+augmentedSBOMFilename,
+		`-dSARIFReportFilename=`+sarifReportFilename,
 		`-dSourceDir=`+sourceDir,
 		`-dResourceDir=`+resourceDir,
 		`-dSslDir=`+binDir,
@@ -799,6 +826,12 @@ func downloadFile(url, dst string) {
 	resp, err := http.Get(url)
 	check(err, "download release file")
 	defer resp.Body.Close()
+
+	if resp.StatusCode > 299 || resp.StatusCode < 200 {
+		body := strings.Builder{}
+		_, _ = io.Copy(&body, resp.Body)
+		log.Panicf("Download %#q: %s %s", url, resp.Status, body.String())
+	}
 
 	_, err = io.Copy(out, resp.Body)
 	check(err, "write release file from http body")
@@ -1093,7 +1126,7 @@ func uploadFeedFile(filename string, feed *download.JSONFeed, awsClient *aws.AWS
 		"uploading download feed to https://s3.amazonaws.com/downloads.mongodb.org/tools/db/%s\n",
 		filename,
 	)
-	err = awsClient.UploadBytes("downloads.mongodb.org", "/tools/db", filename, &feedBuffer)
+	err = awsClient.UploadBytes("downloads.mongodb.org", "tools/db", filename, &feedBuffer)
 	check(err, "upload json feed")
 }
 
@@ -1177,13 +1210,13 @@ func uploadRelease(v version.Version) {
 					"    uploading to https://s3.amazonaws.com/downloads.mongodb.org/tools/db/%s\n",
 					stableFile,
 				)
-				err = awsClient.UploadFile("downloads.mongodb.org", "/tools/db", stableFile)
+				err = awsClient.UploadFile("downloads.mongodb.org", "tools/db", stableFile)
 				check(err, "uploading %q file to S3", stableFile)
 				log.Printf(
 					"    uploading to https://s3.amazonaws.com/downloads.mongodb.org/tools/db/%s\n",
 					latestStableFile,
 				)
-				err = awsClient.UploadFile("downloads.mongodb.org", "/tools/db", latestStableFile)
+				err = awsClient.UploadFile("downloads.mongodb.org", "tools/db", latestStableFile)
 				check(err, "uploading %q file to S3", latestStableFile)
 			}
 		}
@@ -1196,11 +1229,11 @@ type LinuxRepo struct {
 }
 
 var linuxRepoVersionsStable = []LinuxRepo{
-	{"4.4", "4.4.0"}, // any 4.4 stable release version will send the package to the "4.4" repo
 	{"5.0", "5.0.0"}, // any 5.0 stable release version will send the package to the "5.0" repo
 	{"6.0", "6.0.0"}, // any 6.0 stable release version will send the package to the "6.0" repo
 	{"7.0", "7.0.0"}, // any 7.0 stable release version will send the package to the "7.0" repo
 	{"8.0", "8.0.0"}, // any 8.0 stable release version will send the package to the "8.0" repo
+	{"8.2", "8.2.0"}, // any 8.2 stable release version will send the package to the "8.2" repo
 }
 
 var linuxRepoVersionsUnstable = []LinuxRepo{
@@ -1411,15 +1444,9 @@ func downloadMongodAndShell(v string) {
 	err = json.NewDecoder(res.Body).Decode(&feed)
 	check(err, "decode JSON feed")
 
-	target := pf.Name
-	if pf.ServerPlatform != "" {
-		target = pf.ServerPlatform
-	}
-
 	url, githash, serverVersion, err := feed.FindURLHashAndVersion(
 		v,
-		target,
-		string(pf.Arch),
+		pf,
 		"enterprise",
 	)
 	if err == download.ServerURLMissingError {
@@ -1472,8 +1499,13 @@ func downloadBinaries(url string) {
 		log.Fatalf("Expected artifact filename to end in .zip or .tgz, instead got %s", filename)
 	}
 
-	binFiles, err := filepath.Glob(path.Join(tempDir, "mongodb-*", "bin", "*"))
-	check(err, "getting glob of files in temp dir %q", tempDir)
+	var binFiles []string
+	// The directory structure of the Jstestshell artifact tarball changed as of Server 8.2.
+	for _, dirGlob := range []string{"mongodb-*", "dist-test"} {
+		files, err := filepath.Glob(path.Join(tempDir, dirGlob, "bin", "*"))
+		check(err, "getting glob of files in temp dir %q", tempDir)
+		binFiles = append(binFiles, files...)
+	}
 
 	for _, f := range binFiles {
 		if filepath.Ext(f) != ".pdb" {
@@ -1594,12 +1626,12 @@ func downloadArtifacts(v string, artifactNames []string) {
 	evgVersion := fmt.Sprintf("mongo_release_%s", githash)
 	fmt.Printf("Version: %v\n", evgVersion)
 
-	if pf.ServerVariantName == "" {
-		log.Fatalf("ServerVariantName is not set")
+	if pf.ServerVariantNames == nil {
+		log.Fatalf("ServerVariantNames is unset")
 	}
 
-	buildID, err := evergreen.GetPackageTaskForVersion(pf.ServerVariantName, evgVersion)
-	check(err, "get tasks for version")
+	buildID, err := evergreen.GetPackageTaskForVersion(pf, evgVersion)
+	check(err, "get tasks for %s version %s", pf.ServerVariantNames, evgVersion)
 	fmt.Printf("buildID: %v\n", buildID)
 
 	artifacts, err := evergreen.GetArtifactsForTask(buildID)
@@ -1637,7 +1669,8 @@ func getMongoReleaseAccessToken() string {
 
 func getStaticFiles(repoRoot, releaseFilename string) []string {
 	sbomFile := maybeCopyAugmentedSBOMToRoot(repoRoot, releaseFilename)
-	return append(staticFiles, sbomFile)
+	sarifFile := maybeCopySARIFReportToRoot(repoRoot, releaseFilename)
+	return append(staticFiles, sbomFile, sarifFile)
 }
 
 // This is used to trim the repo root off the SBOM file name.
@@ -1666,6 +1699,29 @@ func maybeCopyAugmentedSBOMToRoot(repoRoot, releaseFilename string) string {
 	return prefixRE.ReplaceAllString(targetFile, "")
 }
 
+func maybeCopySARIFReportToRoot(repoRoot, releaseFilename string) string {
+	// This is the naming convention recommended by the OASIS per
+	// https://docs.oasis-open.org/sarif/sarif/v2.1.0/cs01/sarif-v2.1.0-cs01.pdf
+	targetFile := filepath.Join(repoRoot, releaseFilename+".sarif.json")
+	if fileExists(targetFile) {
+		return prefixRE.ReplaceAllString(targetFile, "")
+	}
+
+	var (
+		sourceFile string
+		tag        = os.Getenv("EVG_TRIGGERED_BY_TAG")
+	)
+	if tag != "" {
+		sourceFile = filepath.Join(repoRoot, "ssdlc", tag+".sarif.json")
+	} else {
+		sourceFile = mostRecentSARIFReport(repoRoot)
+	}
+	err := copyFile(sourceFile, targetFile)
+	check(err, "copying %s to %s", sourceFile, targetFile)
+
+	return prefixRE.ReplaceAllString(targetFile, "")
+}
+
 func fileExists(file string) bool {
 	_, err := os.Stat(file)
 	if os.IsNotExist(err) {
@@ -1676,10 +1732,18 @@ func fileExists(file string) bool {
 	return true
 }
 
-var sbomFileVersionRE = regexp.MustCompile(`(\d+\.\d+\.\d+)\.bom\.json`)
+var ssdlcFileVersionRE = regexp.MustCompile(`(\d+\.\d+\.\d+)\.(?:bom|sarif)\.json`)
 
 func mostRecentAugmentedSBOM(repoRoot string) string {
-	glob := filepath.Join(repoRoot, "ssdlc", "*.bom.json")
+	return mostRecentSSDLCFileForGlob(repoRoot, "*.bom.json")
+}
+
+func mostRecentSARIFReport(repoRoot string) string {
+	return mostRecentSSDLCFileForGlob(repoRoot, "*.sarif.json")
+}
+
+func mostRecentSSDLCFileForGlob(repoRoot string, glob string) string {
+	glob = filepath.Join(repoRoot, "ssdlc", glob)
 	paths, err := filepath.Glob(glob)
 	check(err, "glob of %q", glob)
 
@@ -1687,7 +1751,7 @@ func mostRecentAugmentedSBOM(repoRoot string) string {
 	mostRecentVersion, err := version.Parse("0.0.0")
 	check(err, "parsing version 0.0.0")
 	for _, path := range paths {
-		matches := sbomFileVersionRE.FindStringSubmatch(path)
+		matches := ssdlcFileVersionRE.FindStringSubmatch(path)
 		if len(matches) < 2 {
 			log.Fatalf("could not extract version from filename %q", path)
 		}
@@ -1701,8 +1765,21 @@ func mostRecentAugmentedSBOM(repoRoot string) string {
 	}
 
 	if mostRecentFile == "" {
-		log.Fatal("could not find any Augmented SBOM files!")
+		log.Fatalf("could not find any files matching %#q!", glob)
 	}
 
 	return mostRecentFile
+}
+
+func printOsArchCombos() {
+	combos := mapset.NewSet[string]()
+	for _, p := range platform.Platforms() {
+		combos.Add(fmt.Sprintf("%s/%s", p.OS.GoOS(), p.Arch.GoArch()))
+	}
+	slice := combos.ToSlice()
+	slices.Sort(slice)
+
+	for _, c := range slice {
+		fmt.Println(c)
+	}
 }

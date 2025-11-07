@@ -60,7 +60,6 @@ type misnamedTag struct {
 }
 
 type badCodeTag struct {
-	//nolint:staticcheck
 	Z string `json:" !\"#&'()*+,."`
 }
 
@@ -106,7 +105,12 @@ func TestStructTagObjectKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Unmarshal(%#q) failed: %v", b, err)
 		}
-		for i, v := range f.(map[string]interface{}) {
+
+		fMap, isMap := f.(map[string]any)
+		if !isMap {
+			t.Fatalf("Expected map but got %T", f)
+		}
+		for i, v := range fMap {
 			switch i {
 			case tt.key:
 				if s, ok := v.(string); !ok || s != tt.value {
