@@ -8,7 +8,6 @@ package mongoexport
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,7 +70,7 @@ func TestExtendedJSON(t *testing.T) {
 			"subdoc": bson.M{
 				"subid": bson.NewObjectID(),
 			},
-			"array": []interface{}{
+			"array": []any{
 				bson.NewObjectID(),
 				bson.Undefined{},
 			},
@@ -222,11 +221,11 @@ func TestMongoExportTOOLS1952(t *testing.T) {
 		_, err = me.Export(out)
 		So(err, ShouldBeNil)
 
-		count, err := profileCollection.CountDocuments(context.Background(),
+		count, err := profileCollection.CountDocuments(t.Context(),
 			bson.D{
 				{"ns", ns},
 				{"op", "query"},
-				{"$or", []interface{}{
+				{"$or", []any{
 					// 4.0+
 					bson.D{{"command.hint._id", 1}},
 					// 3.6

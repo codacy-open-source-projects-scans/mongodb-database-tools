@@ -58,7 +58,7 @@ func TestOplogDumpVectoredInsertsOplog(t *testing.T) {
 		t.Skipf("Requires server with FCV 8.0 or later; found %v", fcv)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	md, err := simpleMongoDumpInstance()
 	require.NoError(t, err)
@@ -75,7 +75,7 @@ func TestOplogDumpVectoredInsertsOplog(t *testing.T) {
 
 	require.NoError(t, vectoredInsert(ctx))
 	//nolint:errcheck
-	defer tearDownMongoDumpTestData()
+	defer tearDownMongoDumpTestData(t)
 
 	require.NoError(t, md.Dump())
 
@@ -114,7 +114,7 @@ func vectoredInsert(ctx context.Context) error {
 		ctx,
 		options.Session().SetCausalConsistency(false),
 		func(sessionContext context.Context) error {
-			docs := []interface{}{
+			docs := []any{
 				bson.D{{"_id", 100}, {"a", 1}},
 				bson.D{{"_id", 200}, {"a", 2}},
 			}
