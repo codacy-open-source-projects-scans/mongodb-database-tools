@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mongodb/mongo-tools/common"
 	"github.com/mongodb/mongo-tools/common/archive"
 	"github.com/mongodb/mongo-tools/common/bsonutil"
 	"github.com/mongodb/mongo-tools/common/db"
@@ -226,8 +227,9 @@ func (dump *MongoDump) CreateOplogIntents() error {
 		return err
 	}
 	oplogIntent := &intents.Intent{
-		DB: "",
-		C:  "oplog",
+		ServerVersion: dump.serverVersionArray,
+		DB:            "",
+		C:             "oplog",
 	}
 	if dump.OutputOptions.Archive != "" {
 		oplogIntent.BSONFile = &archive.MuxIn{Mux: dump.archive.Mux, Intent: oplogIntent}
@@ -245,16 +247,19 @@ func (dump *MongoDump) CreateUsersRolesVersionIntentsForDB(db string) error {
 	outDir := dump.outputPath(db, "")
 
 	usersIntent := &intents.Intent{
-		DB: db,
-		C:  "$admin.system.users",
+		ServerVersion: dump.serverVersionArray,
+		DB:            db,
+		C:             "$admin.system.users",
 	}
 	rolesIntent := &intents.Intent{
-		DB: db,
-		C:  "$admin.system.roles",
+		ServerVersion: dump.serverVersionArray,
+		DB:            db,
+		C:             "$admin.system.roles",
 	}
 	versionIntent := &intents.Intent{
-		DB: db,
-		C:  "$admin.system.version",
+		ServerVersion: dump.serverVersionArray,
+		DB:            db,
+		C:             "$admin.system.version",
 	}
 	if dump.OutputOptions.Archive != "" {
 		usersIntent.BSONFile = &archive.MuxIn{Intent: usersIntent, Mux: dump.archive.Mux}
@@ -305,10 +310,11 @@ func (dump *MongoDump) NewIntentFromOptions(
 	ci *db.CollectionInfo,
 ) (*intents.Intent, error) {
 	intent := &intents.Intent{
-		DB:      dbName,
-		C:       ci.Name,
-		Options: ci.Options,
-		Type:    ci.Type,
+		ServerVersion: dump.serverVersionArray,
+		DB:            dbName,
+		C:             ci.Name,
+		Options:       ci.Options,
+		Type:          ci.Type,
 	}
 
 	// Populate the intent with the collection UUID or the empty string
@@ -328,8 +334,10 @@ func (dump *MongoDump) NewIntentFromOptions(
 			} else {
 				intent.Location = fmt.Sprintf("archive '%v'", dump.OutputOptions.Archive)
 			}
-		} else if ci.IsTimeseries() {
-			path := nameGz(dump.OutputOptions.Gzip, dump.outputPath(dbName, "system.buckets."+ci.Name)+".bson")
+		} else if ci.IsTimeseries() && !dump.serverVersionArray.SupportsRawData() {
+			// 8.3+ supports viewless timeseries, so they end up in the final else block as a normal
+			// collection.
+			path := nameGz(dump.OutputOptions.Gzip, dump.outputPath(dbName, common.TimeseriesBucketPrefix+ci.Name)+".bson")
 			intent.BSONFile = &realBSONFile{path: path, intent: intent}
 			intent.Location = path
 		} else if ci.IsView() && !dump.OutputOptions.ViewsAsCollections {

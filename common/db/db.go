@@ -24,6 +24,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/mongodb/mongo-tools/common"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
 	"github.com/youmark/pkcs8"
@@ -623,11 +624,19 @@ func TimeseriesBucketNeedsMixedSchema(err error) bool {
 		mongoErr.HasErrorCode(ErrCannotInsertTimeseriesBucketsWithMixedSchema)
 }
 
-// GetTimeseriesCollNameFromBucket returns a timeseries collection name from its bucket collection name.
-func GetTimeseriesCollNameFromBucket(bucketCollName string) (string, error) {
-	collName := strings.TrimPrefix(bucketCollName, "system.buckets.")
-	if collName == bucketCollName || collName == "" {
-		return "", errors.New("invalid timeseries bucket name: " + bucketCollName)
+// GetLogicalTimeseriesCollName returns a timeseries logical collection name from its raw data
+// collection name. For server versions that support the rawData API, this will be the same as
+// the raw name; for versions that don't, it will be the raw name minus the "system.buckets."
+// prefix.
+func GetLogicalTimeseriesCollName(version Version, rawCollName string) (string, error) {
+	if version.SupportsRawData() {
+		// 8.3+ supports viewless timeseries.
+		return rawCollName, nil
+	}
+
+	collName := strings.TrimPrefix(rawCollName, common.TimeseriesBucketPrefix)
+	if collName == rawCollName || collName == "" {
+		return "", errors.New("invalid timeseries bucket name: " + rawCollName)
 	}
 	return collName, nil
 }
