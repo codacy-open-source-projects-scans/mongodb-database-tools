@@ -8,12 +8,17 @@ package mongoexport
 
 import (
 	"bytes"
+	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/mongodb/mongo-tools/common/bsonutil"
@@ -229,6 +234,142 @@ func TestMongoExportTOOLS1952(t *testing.T) {
 	})
 }
 
+// TestExportNestedFieldsCSV verifies that mongoexport correctly handles nested
+// field paths and $ projection in --fields with --csv output.
+func TestExportNestedFieldsCSV(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	log.SetWriter(io.Discard)
+
+	const dbName = "mongoexport_nestedfieldscsv_test"
+	const collName = "source"
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	require.NoError(t, err)
+	client, err := sessionProvider.GetSession()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := client.Database(dbName).Drop(context.Background()); err != nil {
+			t.Errorf("dropping test database: %v", err)
+		}
+	})
+
+	coll := client.Database(dbName).Collection(collName)
+	_, err = coll.InsertMany(t.Context(), []any{
+		bson.D{{"a", bson.A{1, 2, 3, 4, 5}}, {"b", bson.D{{"c", bson.A{-1, -2, -3, -4}}}}},
+		bson.D{
+			{"a", int32(1)},
+			{"b", int32(2)},
+			{"c", int32(3)},
+			{"d", bson.D{{"e", bson.A{4, 5, 6}}}},
+		},
+		bson.D{
+			{"a", int32(1)},
+			{"b", int32(2)},
+			{"c", int32(3)},
+			{"d", int32(5)},
+			{"e", bson.D{{"0", bson.A{"foo", "bar", "baz"}}}},
+		},
+		bson.D{
+			{"a", int32(1)},
+			{"b", int32(2)},
+			{"c", int32(3)},
+			{"d", bson.A{4, 5, 6}},
+			{"e", bson.A{bson.D{{"0", 0}, {"1", 1}}, bson.D{{"2", 2}, {"3", 3}}}},
+		},
+	})
+	require.NoError(t, err)
+
+	toolOptions, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	toolOptions.Namespace = &options.Namespace{DB: dbName, Collection: collName}
+
+	rows := parseCSVRows(t, exportNestedCSV(t, toolOptions, "d.e.2", ""))
+	assert.True(
+		t, rowsContainValue(rows, "d.e.2", "6"),
+		"d.e.2 should select the third element of d.e array",
+	)
+
+	rows = parseCSVRows(t, exportNestedCSV(t, toolOptions, "e.0.0", ""))
+	assert.True(
+		t, rowsContainValue(rows, "e.0.0", "foo"),
+		"e.0.0 should select nested numeric array value",
+	)
+
+	rows = parseCSVRows(t, exportNestedCSV(t, toolOptions, "b,d.1,e.1.3", ""))
+	assert.True(t, rowsContainValue(rows, "b", "2"), "b column should contain 2")
+	assert.True(t, rowsContainValue(rows, "d.1", "5"), "d.1 column should contain 5")
+	assert.True(t, rowsContainValue(rows, "e.1.3", "3"), "e.1.3 column should contain 3")
+
+	// $ projection strips the trailing .$ from the header name and wraps the result in [].
+	rows = parseCSVRows(t, exportNestedCSV(t, toolOptions, "d.$", `{"d": 4}`))
+	assert.True(
+		t, rowsContainValue(rows, "d", "[4]"),
+		"d.$ with query {d:4} should select matching element",
+	)
+
+	rows = parseCSVRows(t, exportNestedCSV(t, toolOptions, "a.$", `{"a": {"$gt": 1}}`))
+	assert.True(
+		t, rowsContainValue(rows, "a", "[2]"),
+		"a.$ with query {a:{$gt:1}} should select matching element",
+	)
+
+	rows = parseCSVRows(t, exportNestedCSV(t, toolOptions, "b.c.$", `{"b.c": -1}`))
+	assert.True(
+		t, rowsContainValue(rows, "b.c", "[-1]"),
+		"b.c.$ with query {b.c:-1} should select matching element",
+	)
+}
+
+func exportNestedCSV(t *testing.T, toolOptions *options.ToolOptions, fields, query string) string {
+	t.Helper()
+	me, err := New(Options{
+		ToolOptions: toolOptions,
+		OutputFormatOptions: &OutputFormatOptions{
+			Type:       "csv",
+			JSONFormat: "canonical",
+			Fields:     fields,
+		},
+		InputOptions: &InputOptions{Query: query},
+	})
+	require.NoError(t, err)
+	defer me.Close()
+	var buf bytes.Buffer
+	_, err = me.Export(&buf)
+	require.NoError(t, err)
+	return buf.String()
+}
+
+func parseCSVRows(t *testing.T, output string) []map[string]string {
+	t.Helper()
+	r := csv.NewReader(strings.NewReader(output))
+	records, err := r.ReadAll()
+	require.NoError(t, err)
+	if len(records) == 0 {
+		return nil
+	}
+	headers := records[0]
+	rows := make([]map[string]string, 0, len(records)-1)
+	for _, record := range records[1:] {
+		row := make(map[string]string, len(headers))
+		for i, h := range headers {
+			if i < len(record) {
+				row[h] = record[i]
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func rowsContainValue(rows []map[string]string, col, val string) bool {
+	for _, row := range rows {
+		if row[col] == val {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBadOptions(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
@@ -311,4 +452,267 @@ func TestBadOptions(t *testing.T) {
 			testCase.errorTestFunc(t, err)
 		}
 	}
+}
+
+// TestBrokenPipe verifies that mongoexport handles a broken pipe gracefully
+// (exits with a write error rather than being killed by SIGPIPE).
+func TestBrokenPipe(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	const (
+		dbName   = "mongoexport_broken_pipe_test"
+		collName = "docs"
+	)
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	require.NoError(t, err)
+	client, err := sessionProvider.GetSession()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = client.Database(dbName).Drop(context.Background())
+	})
+
+	// Insert 1000 docs with a large field so JSON output exceeds the pipe buffer.
+	docs := make([]any, 1000)
+	for i := range 1000 {
+		docs[i] = bson.D{{"_id", int32(i)}, {"data", strings.Repeat("x", 1000)}}
+	}
+	_, err = client.Database(dbName).Collection(collName).InsertMany(context.Background(), docs)
+	require.NoError(t, err)
+
+	args := append(
+		[]string{"run", filepath.Join("..", "mongoexport", "main")},
+		testutil.GetBareArgs()...,
+	)
+	args = append(args, "--db", dbName, "--collection", collName)
+	testutil.AssertBrokenPipeHandled(t, exec.Command("go", args...))
+}
+
+// TestExportNamespaceValidation verifies that mongoexport rejects invalid DB
+// names and accepts system collections.
+func TestExportNamespaceValidation(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	log.SetWriter(io.Discard)
+
+	for _, dbName := range []string{"test.bar", `test"bar`} {
+		toolOptions, err := testutil.GetToolOptions()
+		require.NoError(t, err)
+		toolOptions.Namespace = &options.Namespace{DB: dbName, Collection: "foo"}
+		_, err = New(Options{
+			ToolOptions:         toolOptions,
+			OutputFormatOptions: &OutputFormatOptions{Type: "json", JSONFormat: "canonical"},
+			InputOptions:        &InputOptions{},
+		})
+		assert.Error(t, err, "db name %q should be rejected", dbName)
+	}
+
+	toolOptions, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	toolOptions.Namespace = &options.Namespace{DB: "test", Collection: "system.foobar"}
+	me, err := New(Options{
+		ToolOptions:         toolOptions,
+		OutputFormatOptions: &OutputFormatOptions{Type: "json", JSONFormat: "canonical"},
+		InputOptions:        &InputOptions{},
+	})
+	assert.NoError(t, err, "system collection should be accepted")
+	if me != nil {
+		me.Close()
+	}
+}
+
+// TestExportNoData verifies that exporting an empty collection succeeds, but
+// fails with --assertExists.
+func TestExportNoData(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	log.SetWriter(io.Discard)
+
+	toolOptions, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	toolOptions.Namespace = &options.Namespace{DB: "test", Collection: "mongoexport_no_data_test"}
+
+	me, err := New(Options{
+		ToolOptions:         toolOptions,
+		OutputFormatOptions: &OutputFormatOptions{Type: "json", JSONFormat: "canonical"},
+		InputOptions:        &InputOptions{},
+	})
+	require.NoError(t, err)
+	defer me.Close()
+	var buf bytes.Buffer
+	_, err = me.Export(&buf)
+	assert.NoError(t, err, "export from empty collection should succeed")
+
+	me2, err := New(Options{
+		ToolOptions:         toolOptions,
+		OutputFormatOptions: &OutputFormatOptions{Type: "json", JSONFormat: "canonical"},
+		InputOptions:        &InputOptions{AssertExists: true},
+	})
+	require.NoError(t, err)
+	defer me2.Close()
+	_, err = me2.Export(&buf)
+	assert.Error(t, err, "export with --assertExists should fail on nonexistent collection")
+}
+
+// TestExportPretty verifies that mongoexport --pretty --jsonArray produces
+// indented, parseable JSON with correct field values.
+func TestExportPretty(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	log.SetWriter(io.Discard)
+
+	const dbName = "mongoexport_pretty_test"
+	const collName = "source"
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	require.NoError(t, err)
+	client, err := sessionProvider.GetSession()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := client.Database(dbName).Drop(context.Background()); err != nil {
+			t.Errorf("dropping test database: %v", err)
+		}
+	})
+
+	_, err = client.Database(dbName).Collection(collName).InsertMany(t.Context(), []any{
+		bson.D{{"a", 1}},
+		bson.D{{"a", 1}, {"b", 1}},
+		bson.D{{"a", 1}, {"b", 2}, {"c", 3}},
+	})
+	require.NoError(t, err)
+
+	toolOptions, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	toolOptions.Namespace = &options.Namespace{DB: dbName, Collection: collName}
+	me, err := New(Options{
+		ToolOptions: toolOptions,
+		OutputFormatOptions: &OutputFormatOptions{
+			Type:       "json",
+			JSONFormat: "relaxed",
+			JSONArray:  true,
+			Pretty:     true,
+		},
+		InputOptions: &InputOptions{},
+	})
+	require.NoError(t, err)
+	defer me.Close()
+
+	var buf bytes.Buffer
+	_, err = me.Export(&buf)
+	require.NoError(t, err)
+
+	var docs []map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &docs), "output should be valid JSON array")
+	require.Len(t, docs, 3, "should have 3 documents")
+	assert.Equal(t, float64(1), docs[0]["a"], "docs[0].a should be 1")
+	assert.Equal(t, float64(1), docs[1]["b"], "docs[1].b should be 1")
+	assert.Equal(t, float64(2), docs[2]["b"], "docs[2].b should be 2")
+	assert.Equal(t, float64(3), docs[2]["c"], "docs[2].c should be 3")
+}
+
+// TestExportWritesToStdout verifies that the mongoexport CLI writes all
+// documents to stdout when no --out flag is given.
+func TestExportWritesToStdout(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	log.SetWriter(io.Discard)
+
+	const dbName = "mongoexport_stdout_test"
+	const collName = "data"
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	require.NoError(t, err)
+	client, err := sessionProvider.GetSession()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := client.Database(dbName).Drop(context.Background()); err != nil {
+			t.Errorf("dropping test database: %v", err)
+		}
+	})
+
+	docs := make([]any, 20)
+	for i := range 20 {
+		docs[i] = bson.D{{"_id", i}}
+	}
+	_, err = client.Database(dbName).Collection(collName).InsertMany(t.Context(), docs)
+	require.NoError(t, err)
+
+	args := []string{"go", "run", "./main"}
+	args = append(args, testutil.GetBareArgs()...)
+	args = append(args, "--db", dbName, "--collection", collName)
+	cmd := exec.Command(args[0], args[1:]...)
+	stdout, err := cmd.Output()
+	require.NoError(t, err, "mongoexport should exit 0 when writing to stdout")
+
+	output := string(stdout)
+	for i := range 20 {
+		assert.Contains(t, output, fmt.Sprintf(`"_id":%d`, i), "stdout should contain _id=%d", i)
+	}
+}
+
+// TestExportTypeCase verifies that --type is case-insensitive and that invalid
+// types are rejected.
+func TestExportTypeCase(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	log.SetWriter(io.Discard)
+
+	const dbName = "mongoexport_typecase_test"
+	const collName = "source"
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	require.NoError(t, err)
+	client, err := sessionProvider.GetSession()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := client.Database(dbName).Drop(context.Background()); err != nil {
+			t.Errorf("dropping test database: %v", err)
+		}
+	})
+
+	ns := &options.Namespace{DB: dbName, Collection: collName}
+	_, err = client.Database(dbName).Collection(collName).InsertMany(t.Context(), []any{
+		bson.D{{"a", 1}},
+		bson.D{{"a", 1}, {"b", 1}},
+		bson.D{{"a", 1}, {"b", 2}, {"c", 3}},
+	})
+	require.NoError(t, err)
+
+	_, err = exportWithType(t, ns, "foobar")
+	assert.Error(t, err, "invalid type should be rejected")
+
+	csvLower, err := exportWithType(t, ns, "csv")
+	require.NoError(t, err)
+	csvUpper, err := exportWithType(t, ns, "CSV")
+	require.NoError(t, err)
+	csvMixed, err := exportWithType(t, ns, "cSv")
+	require.NoError(t, err)
+	assert.Equal(t, csvLower, csvUpper, "csv and CSV should produce identical output")
+	assert.Equal(t, csvLower, csvMixed, "csv and cSv should produce identical output")
+
+	jsonLower, err := exportWithType(t, ns, "json")
+	require.NoError(t, err)
+	jsonUpper, err := exportWithType(t, ns, "JSON")
+	require.NoError(t, err)
+	assert.Equal(t, jsonLower, jsonUpper, "json and JSON should produce identical output")
+
+	assert.NotEqual(t, csvLower, jsonLower, "csv and json output should differ")
+}
+
+func exportWithType(t *testing.T, ns *options.Namespace, typeName string) (string, error) {
+	t.Helper()
+	toolOptions, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	toolOptions.Namespace = ns
+	me, err := New(Options{
+		ToolOptions: toolOptions,
+		OutputFormatOptions: &OutputFormatOptions{
+			Type:       typeName,
+			JSONFormat: "relaxed",
+			Fields:     "a",
+		},
+		InputOptions: &InputOptions{},
+	})
+	if err != nil {
+		return "", err
+	}
+	defer me.Close()
+	var buf bytes.Buffer
+	_, err = me.Export(&buf)
+	return buf.String(), err
 }
