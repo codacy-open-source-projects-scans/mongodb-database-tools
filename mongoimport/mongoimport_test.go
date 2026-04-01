@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2705,4 +2706,455 @@ func assertImported(t *testing.T, client *mongo.Client, db, coll string) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, n, "%s.%s should have 2 imported documents", db, coll)
 	require.NoError(t, client.Database(db).Collection(coll).Drop(context.Background()))
+}
+
+// TestRoundTripDecimal128 verifies that a Decimal128 value survives an
+// export-then-import round-trip.
+func TestRoundTripDecimal128(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	const dbName = "mongoimport_decimal128_test"
+	const collName = "dec128"
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	require.NoError(t, err)
+	client, err := sessionProvider.GetSession()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := client.Database(dbName).Drop(context.Background()); err != nil {
+			t.Errorf("dropping test database: %v", err)
+		}
+	})
+
+	dec, err := bson.ParseDecimal128("123456789012345678901234567890")
+	require.NoError(t, err)
+	testDoc := bson.D{{"_id", "foo"}, {"x", dec}}
+
+	coll := client.Database(dbName).Collection(collName)
+	_, err = coll.InsertOne(t.Context(), testDoc)
+	require.NoError(t, err)
+
+	exportToolOptions, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	exportToolOptions.Namespace = &options.Namespace{DB: dbName, Collection: collName}
+	me, err := mongoexport.New(mongoexport.Options{
+		ToolOptions: exportToolOptions,
+		OutputFormatOptions: &mongoexport.OutputFormatOptions{
+			Type:       "json",
+			JSONFormat: "canonical",
+		},
+		InputOptions: &mongoexport.InputOptions{},
+	})
+	require.NoError(t, err)
+	defer me.Close()
+	tmpFile, err := os.CreateTemp(t.TempDir(), "export-*.json")
+	require.NoError(t, err)
+	_, err = me.Export(tmpFile)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	require.NoError(t, coll.Drop(t.Context()))
+
+	importToolOptions, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	importToolOptions.Namespace = &options.Namespace{DB: dbName, Collection: collName}
+	mi, err := New(Options{
+		ToolOptions:   importToolOptions,
+		InputOptions:  &InputOptions{File: tmpFile.Name(), ParseGrace: "stop"},
+		IngestOptions: &IngestOptions{},
+	})
+	require.NoError(t, err)
+	imported, _, err := mi.ImportDocuments()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, imported, "should import 1 document")
+
+	var result bson.D
+	err = coll.FindOne(t.Context(), bson.D{{"_id", "foo"}}).Decode(&result)
+	require.NoError(t, err)
+	assert.Equal(t, testDoc, result, "imported doc should match original")
+}
+
+// TestImportFields verifies --headerline, --fields, --fieldFile, --ignoreBlanks,
+// nested dotted field names, and extra-fields-beyond-header behavior.
+func TestImportFields(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	const dbName = "mongoimport_fields_test"
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	require.NoError(t, err)
+	client, err := sessionProvider.GetSession()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := client.Database(dbName).Drop(context.Background()); err != nil {
+			t.Errorf("dropping test database: %v", err)
+		}
+	})
+
+	tmpDir := t.TempDir()
+	header := []string{"a", "b", "c.xyz", "d.hij.lkm"}
+	rows := [][]string{
+		{"foo", "bar", "blah", "qwz"},
+		{"bob", "", "steve", "sue"},
+		{"one", "two", "three", "four"},
+	}
+
+	for _, format := range []string{"csv", "tsv"} {
+		testImportFieldsForFormat(t, client, dbName, tmpDir, format, header, rows)
+	}
+}
+
+func testImportFieldsForFormat(
+	t *testing.T,
+	client *mongo.Client,
+	dbName, tmpDir, format string,
+	header []string,
+	rows [][]string,
+) {
+	t.Helper()
+
+	separator, ok := map[string]rune{
+		"csv": ',',
+		"tsv": '\t',
+	}[format]
+	require.True(t, ok, "found a separator for %#q format", format)
+
+	headerFile := filepath.Join(tmpDir, "header."+format)
+	writeXSVFile(t, headerFile, separator, append([][]string{header}, rows...))
+
+	noHeaderFile := filepath.Join(tmpDir, "noheader."+format)
+	writeXSVFile(t, noHeaderFile, separator, rows)
+	fieldFilePath := writeFieldFile(t, tmpDir, "fieldfile."+format, header)
+
+	t.Run(format+"/headerline", func(t *testing.T) {
+		importAndCheckFields(t, client, importFieldsOpts{
+			dbName:     dbName,
+			inputFile:  headerFile,
+			format:     format,
+			headerLine: true,
+		})
+	})
+
+	t.Run(format+"/fields", func(t *testing.T) {
+		fields := "a,b,c.xyz,d.hij.lkm"
+		importAndCheckFields(t, client, importFieldsOpts{
+			dbName:    dbName,
+			inputFile: noHeaderFile,
+			format:    format,
+			fields:    &fields,
+		})
+	})
+
+	t.Run(format+"/fieldFile", func(t *testing.T) {
+		importAndCheckFields(t, client, importFieldsOpts{
+			dbName:        dbName,
+			inputFile:     noHeaderFile,
+			format:        format,
+			fieldFilePath: fieldFilePath,
+		})
+		coll := client.Database(dbName).Collection(format + "testcoll")
+		var bobDoc bson.M
+		err := coll.FindOne(t.Context(), bson.D{{"a", "bob"}}).Decode(&bobDoc)
+		require.NoError(t, err)
+		assert.Equal(
+			t, "", bobDoc["b"],
+			"%s: blank field should be empty string without --ignoreBlanks", format,
+		)
+	})
+
+	t.Run(format+"/ignoreBlanks", func(t *testing.T) {
+		importAndCheckFields(t, client, importFieldsOpts{
+			dbName:        dbName,
+			inputFile:     noHeaderFile,
+			format:        format,
+			fieldFilePath: fieldFilePath,
+			ignoreBlanks:  true,
+		})
+		coll := client.Database(dbName).Collection(format + "testcoll")
+		var bobDoc bson.M
+		err := coll.FindOne(t.Context(), bson.D{{"a", "bob"}}).Decode(&bobDoc)
+		require.NoError(t, err)
+		_, hasB := bobDoc["b"]
+		assert.False(t, hasB, "%s: blank field should be omitted with --ignoreBlanks", format)
+	})
+
+	t.Run(format+"/noFieldSpec", func(t *testing.T) {
+		toolOpts, err := testutil.GetToolOptions()
+		require.NoError(t, err)
+		toolOpts.Namespace = &options.Namespace{DB: dbName, Collection: format + "testcoll"}
+		_, err = New(Options{
+			ToolOptions:   toolOpts,
+			InputOptions:  &InputOptions{File: noHeaderFile, Type: format, ParseGrace: "stop"},
+			IngestOptions: &IngestOptions{},
+		})
+		assert.Error(t, err, "%s: import without field spec should fail", format)
+	})
+}
+
+type importFieldsOpts struct {
+	dbName        string
+	inputFile     string
+	format        string
+	fieldFilePath string
+	fields        *string
+	headerLine    bool
+	ignoreBlanks  bool
+}
+
+func importAndCheckFields(t *testing.T, client *mongo.Client, o importFieldsOpts) {
+	t.Helper()
+	collName := o.format + "testcoll"
+	require.NoError(t, client.Database(o.dbName).Collection(collName).Drop(t.Context()))
+	toolOpts, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	toolOpts.Namespace = &options.Namespace{DB: o.dbName, Collection: collName}
+	var ffPtr *string
+	if o.fieldFilePath != "" {
+		ffPtr = &o.fieldFilePath
+	}
+	mi, err := New(Options{
+		ToolOptions: toolOpts,
+		InputOptions: &InputOptions{
+			File:       o.inputFile,
+			Type:       o.format,
+			HeaderLine: o.headerLine,
+			FieldFile:  ffPtr,
+			Fields:     o.fields,
+			ParseGrace: "stop",
+		},
+		IngestOptions: &IngestOptions{IgnoreBlanks: o.ignoreBlanks},
+	})
+	require.NoError(t, err)
+	_, _, err = mi.ImportDocuments()
+	require.NoError(t, err)
+
+	coll := client.Database(o.dbName).Collection(collName)
+	n, err := coll.CountDocuments(t.Context(), bson.D{})
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, n, "%s: should import 3 documents", o.format)
+
+	nestedQuery := bson.D{
+		{"a", "foo"},
+		{"b", "bar"},
+		{"c.xyz", "blah"},
+		{"d.hij.lkm", "qwz"},
+	}
+	n, err = coll.CountDocuments(t.Context(), nestedQuery)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, n, "%s: nested fields should be stored correctly", o.format)
+}
+
+// TestImportExtraFields verifies that CSV columns beyond the fieldFile mapping
+// are imported as field4, field5, etc.
+func TestImportExtraFields(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	const dbName = "mongoimport_extrafields_test"
+	const collName = "extrafields"
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	require.NoError(t, err)
+	client, err := sessionProvider.GetSession()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := client.Database(dbName).Drop(context.Background()); err != nil {
+			t.Errorf("dropping test database: %v", err)
+		}
+	})
+
+	tmpDir := t.TempDir()
+	extraRows := [][]string{
+		{"foo", "bar", "blah", "qwz"},
+		{"bob", "", "steve", "sue"},
+		{"one", "two", "three", "four", "extra1", "extra2", "extra3"},
+	}
+	extraFile := filepath.Join(tmpDir, "extrafields.csv")
+	writeXSVFile(t, extraFile, ',', extraRows)
+
+	fieldNames := []string{"a", "b", "c.xyz", "d.hij.lkm"}
+	fieldFilePath := writeFieldFile(t, tmpDir, "fieldfile", fieldNames)
+
+	toolOpts, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	toolOpts.Namespace = &options.Namespace{DB: dbName, Collection: collName}
+	mi, err := New(Options{
+		ToolOptions: toolOpts,
+		InputOptions: &InputOptions{
+			File:       extraFile,
+			Type:       "csv",
+			FieldFile:  &fieldFilePath,
+			ParseGrace: "stop",
+		},
+		IngestOptions: &IngestOptions{},
+	})
+	require.NoError(t, err)
+	_, _, err = mi.ImportDocuments()
+	require.NoError(t, err)
+
+	var doc bson.M
+	err = client.Database(dbName).Collection(collName).
+		FindOne(t.Context(), bson.D{{"a", "one"}}).Decode(&doc)
+	require.NoError(t, err)
+	assert.Equal(t, "extra1", doc["field4"], "field4 should contain first extra value")
+	assert.Equal(t, "extra2", doc["field5"], "field5 should contain second extra value")
+	assert.Equal(t, "extra3", doc["field6"], "field6 should contain third extra value")
+}
+
+func writeXSVFile(t *testing.T, path string, separator rune, records [][]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	w := csv.NewWriter(f)
+	w.Comma = separator
+	require.NoError(t, w.WriteAll(records))
+	require.NoError(t, f.Close())
+}
+
+func writeFieldFile(t *testing.T, dir, name string, fields []string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join(fields, "\n")+"\n"), 0o644))
+	return path
+}
+
+// TestImportDocumentValidation verifies mongoimport behavior with collection
+// validators: normal import skips invalid docs, --bypassDocumentValidation
+// imports all, --stopOnError and --maintainInsertionOrder fail on validation
+// errors.
+func TestImportDocumentValidation(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	const dbName = "mongoimport_docvalidation_test"
+	const collName = "docvalidation"
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	require.NoError(t, err)
+	client, err := sessionProvider.GetSession()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := client.Database(dbName).Drop(context.Background()); err != nil {
+			t.Errorf("dropping test database: %v", err)
+		}
+	})
+
+	db := client.Database(dbName)
+
+	// 1000 docs: even-indexed lack `baz` (invalid), odd-indexed have `baz` (valid).
+	docs := make([]any, 1000)
+	for i := range 1000 {
+		if i%2 == 0 {
+			docs[i] = bson.D{{"_id", i}, {"num", i + 1}, {"s", fmt.Sprintf("%d", i)}}
+		} else {
+			docs[i] = bson.D{{"_id", i}, {"num", i + 1}, {"s", fmt.Sprintf("%d", i)}, {"baz", i}}
+		}
+	}
+	_, err = db.Collection(collName).InsertMany(t.Context(), docs)
+	require.NoError(t, err)
+
+	exportToolOptions, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	exportToolOptions.Namespace = &options.Namespace{DB: dbName, Collection: collName}
+	me, err := mongoexport.New(mongoexport.Options{
+		ToolOptions: exportToolOptions,
+		OutputFormatOptions: &mongoexport.OutputFormatOptions{
+			Type:       "json",
+			JSONFormat: "canonical",
+		},
+		InputOptions: &mongoexport.InputOptions{},
+	})
+	require.NoError(t, err)
+	defer me.Close()
+	tmpFile, err := os.CreateTemp(t.TempDir(), "export-*.json")
+	require.NoError(t, err)
+	_, err = me.Export(tmpFile)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	validator := bson.D{{"baz", bson.D{{"$exists", true}}}}
+	ns := &options.Namespace{DB: dbName, Collection: collName}
+
+	t.Run("no validator imports all docs", func(t *testing.T) {
+		require.NoError(t, db.Drop(t.Context()))
+		require.NoError(t, importWithIngestOpts(t, ns, tmpFile.Name(), IngestOptions{}))
+		n, err := db.Collection(collName).CountDocuments(t.Context(), bson.D{})
+		require.NoError(t, err)
+		assert.EqualValues(t, 1000, n, "import without validation should import all 1000 documents")
+	})
+
+	t.Run("validator skips invalid docs", func(t *testing.T) {
+		recreateWithValidator(t, db, collName, validator)
+		require.NoError(t, importWithIngestOpts(t, ns, tmpFile.Name(), IngestOptions{}))
+		n, err := db.Collection(collName).CountDocuments(t.Context(), bson.D{})
+		require.NoError(t, err)
+		assert.EqualValues(t, 500, n, "only valid documents should be imported")
+	})
+
+	t.Run("stopOnError fails on validation errors", func(t *testing.T) {
+		recreateWithValidator(t, db, collName, validator)
+		err := importWithIngestOpts(t, ns, tmpFile.Name(), IngestOptions{StopOnError: true})
+		assertValidationError(t, err, "import with --stopOnError should fail on validation errors")
+	})
+
+	t.Run("maintainInsertionOrder fails on validation errors", func(t *testing.T) {
+		recreateWithValidator(t, db, collName, validator)
+		err := importWithIngestOpts(
+			t, ns, tmpFile.Name(), IngestOptions{MaintainInsertionOrder: true},
+		)
+		assertValidationError(
+			t, err, "import with --maintainInsertionOrder should fail on validation errors",
+		)
+	})
+
+	t.Run("bypassDocumentValidation imports all docs", func(t *testing.T) {
+		recreateWithValidator(t, db, collName, validator)
+		require.NoError(t, importWithIngestOpts(
+			t, ns, tmpFile.Name(), IngestOptions{BypassDocumentValidation: true},
+		))
+		n, err := db.Collection(collName).CountDocuments(t.Context(), bson.D{})
+		require.NoError(t, err)
+		assert.EqualValues(
+			t, 1000, n, "all documents should be imported with --bypassDocumentValidation",
+		)
+	})
+}
+
+//nolint:unparam
+func recreateWithValidator(t *testing.T, db *mongo.Database, collName string, validator any) {
+	t.Helper()
+	require.NoError(t, db.Drop(context.Background()))
+	require.NoError(
+		t,
+		db.CreateCollection(
+			context.Background(), collName, mopt.CreateCollection().SetValidator(validator),
+		),
+	)
+}
+
+func assertValidationError(t *testing.T, err error, msg string) {
+	t.Helper()
+	var bwe mongo.BulkWriteException
+	if assert.ErrorAs(t, err, &bwe, msg) {
+		assert.NotEmpty(t, bwe.WriteErrors, "should have at least one write error")
+		assert.Equal(t, 121, bwe.WriteErrors[0].Code, "should be DocumentValidationFailure (121)")
+	}
+}
+
+func importWithIngestOpts(
+	t *testing.T,
+	ns *options.Namespace,
+	filePath string,
+	ingestOpts IngestOptions,
+) error {
+	t.Helper()
+	toolOptions, err := testutil.GetToolOptions()
+	require.NoError(t, err)
+	toolOptions.Namespace = ns
+	mi, err := New(Options{
+		ToolOptions:   toolOptions,
+		InputOptions:  &InputOptions{File: filePath, ParseGrace: "stop"},
+		IngestOptions: &ingestOpts,
+	})
+	require.NoError(t, err)
+	_, _, err = mi.ImportDocuments()
+	return err
 }
