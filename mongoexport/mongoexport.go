@@ -297,9 +297,8 @@ func (exp *MongoExport) getCount() (int64, error) {
 
 	log.Logvf(
 		log.DebugHigh,
-		"Getting estimated count for %v.%v",
-		exp.ToolOptions.DB,
-		exp.ToolOptions.Collection,
+		"Getting estimated count for %#q",
+		exp.ToolOptions.DB+"."+exp.ToolOptions.Collection,
 	)
 	c, err := coll.EstimatedDocumentCount(context.TODO())
 	if err != nil {
@@ -389,7 +388,7 @@ func (exp *MongoExport) verifyCollectionExists() (bool, error) {
 		var collInfoErr error
 		if exp.InputOpts.AssertExists {
 			collInfoErr = fmt.Errorf(
-				"collection '%s' does not exist",
+				"collection %#q does not exist",
 				exp.ToolOptions.Collection,
 			)
 		}
