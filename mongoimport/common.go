@@ -9,18 +9,18 @@ package mongoimport
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"github.com/mongodb/mongo-tools/common/bsonutil"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/util"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"gopkg.in/tomb.v2"
+	"golang.org/x/sync/errgroup"
 )
 
 type ParseGrace int
@@ -70,9 +70,6 @@ type importWorker struct {
 
 	// used to stream the processed document back to the caller
 	processedDocumentChan chan bson.D
-
-	// used to synchronize all worker goroutines
-	tomb *tomb.Tomb
 }
 
 // an interface for tracking the number of bytes, which is used in mongoimport to feed
@@ -134,19 +131,6 @@ func newBomDiscardingReader(r io.Reader) *bomDiscardingReader {
 	return &bomDiscardingReader{buf: bufio.NewReader(r)}
 }
 
-const quorum = 2
-
-// channelQuorumError takes a channel and either returns the first non-nil error received on the
-// channel or nil if up to 2 nil errors are received.
-func channelQuorumError(ch <-chan error) (err error) {
-	for i := 0; i < quorum; i++ {
-		if err = <-ch; err != nil {
-			return
-		}
-	}
-	return
-}
-
 // constructUpsertDocument constructs a BSON document to use for upserts.
 func constructUpsertDocument(upsertFields []string, document bson.D) bson.D {
 	upsertDocument := bson.D{}
@@ -169,6 +153,8 @@ func constructUpsertDocument(upsertFields []string, document bson.D) bson.D {
 // the input channel to each worker and then sequentially reads the processed data
 // from each worker before passing it on to the output channel.
 func doSequentialStreaming(
+	ctx context.Context,
+	eg *errgroup.Group,
 	workers []*importWorker,
 	readDocs chan Converter,
 	outputChan chan bson.D,
@@ -177,10 +163,14 @@ func doSequentialStreaming(
 
 	// feed in the data to be processed and do round-robin
 	// reads from each worker once processing is completed
-	go func() {
+	eg.Go(func() error {
 		i := 0
 		for doc := range readDocs {
-			workers[i].unprocessedDataChan <- doc
+			select {
+			case workers[i].unprocessedDataChan <- doc:
+			case <-ctx.Done():
+				return nil
+			}
 			i = (i + 1) % numWorkers
 		}
 
@@ -188,18 +178,27 @@ func doSequentialStreaming(
 		for i := 0; i < numWorkers; i++ {
 			close(workers[i].unprocessedDataChan)
 		}
-	}()
+		return nil
+	})
 
 	// coordinate the order in which the documents are sent over to the
 	// main output channel
 	numDoneWorkers := 0
 	i := 0
 	for {
-		processedDocument, open := <-workers[i].processedDocumentChan
-		if open {
-			outputChan <- processedDocument
-		} else {
-			numDoneWorkers++
+		select {
+		case processedDocument, open := <-workers[i].processedDocumentChan:
+			if open {
+				select {
+				case outputChan <- processedDocument:
+				case <-ctx.Done():
+					return
+				}
+			} else {
+				numDoneWorkers++
+			}
+		case <-ctx.Done():
+			return
 		}
 		if numDoneWorkers == numWorkers {
 			break
@@ -452,51 +451,52 @@ func isNatNum(s string) (int, bool) {
 // channel - either in sequence or concurrently (depending on the value of
 // ordered) - in which the data was received.
 func streamDocuments(
+	ctx context.Context,
 	ordered bool,
 	numDecoders int,
-	readDocs chan Converter,
-	outputChan chan bson.D,
-) (retErr error) {
+	docsInChan chan Converter,
+	streamOutChan chan bson.D,
+) error {
 	if numDecoders == 0 {
 		numDecoders = 1
 	}
 	var importWorkers []*importWorker
-	wg := new(sync.WaitGroup)
-	importTomb := new(tomb.Tomb)
-	inChan := readDocs
-	outChan := outputChan
+
+	eg, ctx := errgroup.WithContext(ctx)
+	// workerInChan and workerOutChan are the channels each worker reads from and writes to. With
+	// ordered=true, workers use intermediate buffered channels so doSequentialStreaming can
+	// coordinate output order; docsInChan and streamOutChan are passed unchanged to
+	// doSequentialStreaming so that the caller's read goroutine (sending to docsInChan) and the
+	// final consumer (reading from streamOutChan) communicate with the right channels. Don't
+	// reassign docsInChan or streamOutChan here - that would disconnect the caller's goroutines
+	// from the pipeline.
+	workerInChan := docsInChan
+	workerOutChan := streamOutChan
+
 	for i := 0; i < numDecoders; i++ {
 		if ordered {
-			inChan = make(chan Converter, workerBufferSize)
-			outChan = make(chan bson.D, workerBufferSize)
+			workerInChan = make(chan Converter, workerBufferSize)
+			workerOutChan = make(chan bson.D, workerBufferSize)
 		}
 		iw := &importWorker{
-			unprocessedDataChan:   inChan,
-			processedDocumentChan: outChan,
-			tomb:                  importTomb,
+			unprocessedDataChan:   workerInChan,
+			processedDocumentChan: workerOutChan,
 		}
 		importWorkers = append(importWorkers, iw)
-		wg.Add(1)
-		go func(iw importWorker) {
-			defer wg.Done()
-			// only set the first worker error and cause sibling goroutines
-			// to terminate immediately
-			err := iw.processDocuments(ordered)
-			if err != nil && retErr == nil {
-				retErr = err
-				iw.tomb.Kill(err)
-			}
-		}(*iw)
+		eg.Go(func() error {
+			return iw.processDocuments(ctx, ordered)
+		})
 	}
 
 	// if ordered, we have to coordinate the sequence in which processed
 	// documents are passed to the main read channel
 	if ordered {
-		doSequentialStreaming(importWorkers, readDocs, outputChan)
+		doSequentialStreaming(ctx, eg, importWorkers, docsInChan, streamOutChan)
 	}
-	wg.Wait()
-	close(outputChan)
-	return
+	err := eg.Wait()
+	close(streamOutChan)
+
+	return err
 }
 
 // coercionError should only be used as a specific error type to check
@@ -852,7 +852,7 @@ func validateReaderFields(fields []string, useArrayIndexFields bool) error {
 // to a bson.D document before sending it on the processedDocumentChan channel. Once the
 // input channel is closed the processed channel is also closed if the worker streams its
 // reads in order.
-func (iw *importWorker) processDocuments(ordered bool) error {
+func (iw *importWorker) processDocuments(ctx context.Context, ordered bool) error {
 	if ordered {
 		defer close(iw.processedDocumentChan)
 	}
@@ -869,8 +869,12 @@ func (iw *importWorker) processDocuments(ordered bool) error {
 			if document == nil {
 				continue
 			}
-			iw.processedDocumentChan <- document
-		case <-iw.tomb.Dying():
+			select {
+			case iw.processedDocumentChan <- document:
+			case <-ctx.Done():
+				return nil
+			}
+		case <-ctx.Done():
 			return nil
 		}
 	}
