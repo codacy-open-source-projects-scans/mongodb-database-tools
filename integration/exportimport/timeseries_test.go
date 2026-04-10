@@ -1,4 +1,4 @@
-package importexport
+package exportimport
 
 import (
 	"bytes"
@@ -11,25 +11,13 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
-func (s *ImportExportSuite) TestTimeseries() {
+func (s *ExportImportSuite) TestTimeseries() {
 	s.RequireFCVAtLeast("5.0")
 
 	client := s.Client()
 	serverVersion := s.ServerVersion()
 
 	fromDBName, toDBName, collName := "fromdb", "todb", "tscoll"
-
-	cleanup := func() {
-		err := client.Database(fromDBName).Drop(s.T().Context())
-		s.Require().NoError(err)
-
-		err = client.Database(toDBName).Drop(s.T().Context())
-		s.Require().NoError(err)
-	}
-
-	cleanup()
-	defer cleanup()
-
 	testutil.SetUpTimeseries(s.T(), fromDBName, collName)
 
 	s.Run("logical documents", func() {
@@ -62,7 +50,7 @@ func (s *ImportExportSuite) TestTimeseries() {
 			}
 
 			db := client.Database(toDBName)
-			res := db.RunCommand(s.T().Context(), createCmd)
+			res := db.RunCommand(s.Context(), createCmd)
 			s.Require().NoError(res.Err(), "create timeseries coll")
 
 			opts := s.ImportOptions(toDBName, collName)

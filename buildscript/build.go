@@ -180,6 +180,15 @@ func runTests(ctx *task.Context, pkgs []string, testType string) error {
 		// Use the recursive wildcard (...) to run all tests
 		// of the provided testType for the current pkg.
 		args := []string{"test", "./" + pkg + "/..."}
+		if pkg == "integration" {
+			// We need to run the tests in these packages sequentially because they all share a
+			// single test cluster. When they're run in parallel, they can step on each other.
+			args = append(
+				args,
+				"-p", "1",
+				"-parallel", "1",
+			)
+		}
 		args = append(args, buildFlags...)
 		if ctx.Verbose {
 			args = append(args, "-v")
