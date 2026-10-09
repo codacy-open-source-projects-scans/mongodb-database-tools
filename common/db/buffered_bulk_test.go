@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mongodb/mongo-tools/common/options"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,18 +20,7 @@ import (
 func TestBufferedBulkInserterInserts(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	auth := DBGetAuthOptions()
-	ssl := DBGetSSLOptions()
-	opts := options.ToolOptions{
-		Connection: &options.Connection{
-			Port: DefaultTestPort,
-		},
-		URI:  &options.URI{},
-		SSL:  &ssl,
-		Auth: &auth,
-	}
-	err := opts.NormalizeOptionsAndURI()
-	require.NoError(t, err)
+	opts := testopts.MustGetToolOptions(t)
 	provider, err := NewSessionProvider(opts)
 	require.NoError(t, err)
 	require.NotNil(t, provider)
@@ -55,7 +44,7 @@ func TestBufferedBulkInserterInserts(t *testing.T) {
 		require.NotNil(t, bufBulk)
 
 		flushCount := 0
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			result, err := bufBulk.Insert(t.Context(), bson.D{})
 			require.NoError(t, err)
 			if bufBulk.docCount%3 == 0 {
@@ -76,7 +65,7 @@ func TestBufferedBulkInserterInserts(t *testing.T) {
 		bufBulk := NewUnorderedBufferedBulkInserter(testCol, 1, serverVersion)
 		require.NotNil(t, bufBulk)
 
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			result, err := bufBulk.Insert(t.Context(), bson.D{})
 			require.NoError(t, err)
 			require.NotNil(t, result)
@@ -97,7 +86,7 @@ func TestBufferedBulkInserterInserts(t *testing.T) {
 		require.NotNil(t, bufBulk)
 
 		errCnt := 0
-		for i := 0; i < 1_000_000; i++ {
+		for i := range 1_000_000 {
 			result, err := bufBulk.Insert(t.Context(), bson.M{"_id": i})
 			if err != nil {
 				errCnt++
@@ -170,7 +159,7 @@ func TestBufferedBulkInserterInserts(t *testing.T) {
 		// Each doc is ~5 KB; after ~9500 buffered the next triggers a byteLimit flush.
 		docPayload := strings.Repeat("y", 5000)
 		var flushed bool
-		for i := 0; i < 10000; i++ {
+		for range 10000 {
 			result, insertErr := bufBulk.Insert(t.Context(), bson.M{"data": docPayload})
 			require.NoError(t, insertErr)
 			if result != nil {
@@ -191,7 +180,7 @@ func TestBufferedBulkInserterInserts(t *testing.T) {
 		require.NotNil(t, bufBulk)
 		bufBulk.byteLimit = 1
 
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			result, err := bufBulk.Insert(t.Context(), bson.D{{"foo", "bar"}})
 			require.NoError(t, err)
 			if i == 0 {

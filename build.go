@@ -45,17 +45,15 @@ func init() {
 		Do(buildscript.WriteThirdPartyNotices)
 
 	// Static Analysis
-	taskRegistry.Declare("sa:installdevtools").
-		Description("installs dev tools").
-		Do(buildscript.SAInstallDevTools)
 	taskRegistry.Declare("sa:lint").
 		Description("runs precious linting").
-		DependsOn("sa:installdevtools").
 		Do(buildscript.SAPreciousLint)
-	taskRegistry.Declare("sa:modtidy").Description("runs go mod tidy").Do(buildscript.SAModTidy)
-	taskRegistry.Declare("sa:evgvalidate").
-		Description("runs evergreen validate").
-		Do(buildscript.SAEvergreenValidate)
+	taskRegistry.Declare("sa:modtidy").
+		Description("runs go mod tidy").
+		Do(buildscript.SAModTidy)
+	taskRegistry.Declare("sa:checkVendoredCode").
+		Description("checks that vendored code has no unexpected local changes").
+		Do(buildscript.SACheckVendoredCode)
 
 	// Testing
 	taskRegistry.Declare("test:unit").
@@ -66,6 +64,10 @@ func init() {
 		Description("runs all integration tests").
 		OptionalArgs("pkgs", "ssl", "auth", "kerberos", "topology", "race").
 		Do(buildscript.TestIntegration)
+	taskRegistry.Declare("test:cross-cluster").
+		Description("runs the dump/restore and export/import round-trip tests across two clusters").
+		OptionalArgs("ssl", "topology", "race").
+		Do(buildscript.TestCrossCluster)
 	taskRegistry.Declare("test:sharded-integration").
 		Description("runs tests requiring a sharded cluster topology").
 		OptionalArgs("pkgs", "ssl", "race").

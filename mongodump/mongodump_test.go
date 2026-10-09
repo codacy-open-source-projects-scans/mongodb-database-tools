@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,9 +32,9 @@ import (
 	"github.com/mongodb/mongo-tools/common/json"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/mongodb/mongo-tools/common/testutil"
-	"github.com/mongodb/mongo-tools/common/util"
 	"github.com/pkg/errors"
 	. "github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/assert"
@@ -62,7 +63,7 @@ const (
 )
 
 func simpleMongoDumpInstance() (*MongoDump, error) {
-	toolOptions, err := testutil.GetToolOptions()
+	toolOptions, err := testopts.GetToolOptions()
 	if err != nil {
 		return nil, fmt.Errorf("error getting tool options to create a mongodump instance: %w", err)
 	}
@@ -84,10 +85,9 @@ func simpleMongoDumpInstance() (*MongoDump, error) {
 	}, nil
 }
 
-// returns the number of .bson files in a directory
-// excluding system.indexes.bson.
-func countNonIndexBSONFiles(dir string) (int, error) {
-	files, err := listNonIndexBSONFiles(dir)
+// returns the number of .bson files in a directory.
+func countBSONFiles(dir string) (int, error) {
+	files, err := listBSONFiles(dir)
 	if err != nil {
 		return 0, err
 	}
@@ -104,18 +104,8 @@ func assertBSONEqual(t *testing.T, expected, actual any) {
 	assert.Equal(t, string(expectedJSON), string(actualJSON))
 }
 
-func listNonIndexBSONFiles(dir string) ([]string, error) {
-	var files []string
-	matchingFiles, err := getMatchingFiles(dir, ".*\\.bson")
-	if err != nil {
-		return nil, err
-	}
-	for _, fileName := range matchingFiles {
-		if fileName != "system.indexes.bson" {
-			files = append(files, fileName)
-		}
-	}
-	return files, nil
+func listBSONFiles(dir string) ([]string, error) {
+	return getMatchingFiles(dir, ".*\\.bson")
 }
 
 // returns count of metadata files.
@@ -189,7 +179,7 @@ func readBSONIntoDatabase(t *testing.T, dir, restoreDBName string) error {
 		return fmt.Errorf("error finding '%v' on local FS", dir)
 	}
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		return err
 	}
@@ -201,11 +191,11 @@ func readBSONIntoDatabase(t *testing.T, dir, restoreDBName string) error {
 
 	for _, fileInfo := range fileInfos {
 		fileName := fileInfo.Name()
-		if !strings.HasSuffix(fileName, ".bson") || fileName == "system.indexes.bson" {
+		if !strings.HasSuffix(fileName, ".bson") {
 			continue
 		}
 
-		collectionName, err := util.UnescapeCollectionName(
+		collectionName, err := url.QueryUnescape(
 			fileName[:strings.LastIndex(fileName, ".bson")],
 		)
 		if err != nil {
@@ -239,7 +229,7 @@ func readBSONIntoDatabase(t *testing.T, dir, restoreDBName string) error {
 }
 
 func setUpMongoDumpTestData(t *testing.T) error {
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		return err
 	}
@@ -275,7 +265,7 @@ func setUpMongoDumpTestData(t *testing.T) error {
 }
 
 func setupTimeseriesWithMixedSchema(t *testing.T, dbName string, collName string) {
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err, "get session provider")
 
 	serverVersion, err := sessionProvider.ServerVersionArray()
@@ -321,12 +311,10 @@ func setupTimeseriesWithMixedSchema(t *testing.T, dbName string, collName string
 	bucketName := timeseriesCollName(serverVersion, collName)
 	bucketColl := sessionProvider.DB(dbName).Collection(bucketName)
 	bucketJSON := `{"_id":{"$oid":"65a6eb806ffc9fa4280ecac4"},"control":{"version":1,"min":{"_id":{"$oid":"65a6eba7e6d2e848e08c3750"},"t":{"$date":"2024-01-16T20:48:00Z"},"a":1},"max":{"_id":{"$oid":"65a6eba7e6d2e848e08c3751"},"t":{"$date":"2024-01-16T20:48:39.448Z"},"a":"a"}},"meta":0,"data":{"_id":{"0":{"$oid":"65a6eba7e6d2e848e08c3750"},"1":{"$oid":"65a6eba7e6d2e848e08c3751"}},"t":{"0":{"$date":"2024-01-16T20:48:39.448Z"},"1":{"$date":"2024-01-16T20:48:39.448Z"}},"a":{"0":"a","1":1}}}`
-	var bucketMap map[string]any
-	err = json.Unmarshal([]byte(bucketJSON), &bucketMap)
-	require.NoError(t, err, "unmarshal json")
 
-	err = bsonutil.ConvertLegacyExtJSONDocumentToBSON(bucketMap)
-	require.NoError(t, err, "convert extjson to bson")
+	var bucketDoc bson.D
+	err = bson.UnmarshalExtJSON([]byte(bucketJSON), false, &bucketDoc)
+	require.NoError(t, err, "unmarshal ext json")
 
 	opts := mopt.InsertOne()
 	if serverVersion.SupportsRawData() {
@@ -334,7 +322,7 @@ func setupTimeseriesWithMixedSchema(t *testing.T, dbName string, collName string
 		require.NoError(t, err)
 	}
 
-	_, err = bucketColl.InsertOne(t.Context(), bucketMap, opts)
+	_, err = bucketColl.InsertOne(t.Context(), bucketDoc, opts)
 	require.NoError(t, err, "insert bucket doc")
 }
 
@@ -347,8 +335,8 @@ func timeseriesCollName(version db.Version, base string) string {
 	return common.TimeseriesBucketPrefix + base
 }
 
-func setUpDBView(dbName string, colName string) error {
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+func setUpDBView(t *testing.T, dbName string, colName string) error {
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		return err
 	}
@@ -367,8 +355,8 @@ func setUpDBView(dbName string, colName string) error {
 	return nil
 }
 
-func turnOnProfiling(dbName string) error {
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+func turnOnProfiling(t *testing.T, dbName string) error {
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		return err
 	}
@@ -411,7 +399,7 @@ func countSnapshotCmds(
 // function returns.  Any errors are passed back on the errs channel.
 func backgroundInsert(t *testing.T, ready, done chan struct{}, errs chan error) {
 	defer close(errs)
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		errs <- err
 		close(ready)
@@ -453,7 +441,7 @@ func backgroundInsert(t *testing.T, ready, done chan struct{}, errs chan error) 
 }
 
 func tearDownMongoDumpTestData(t *testing.T) error {
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		return err
 	}
@@ -466,7 +454,7 @@ func tearDownMongoDumpTestData(t *testing.T) error {
 }
 
 func dropDB(t *testing.T, dbName string) error {
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		return err
 	}
@@ -508,8 +496,8 @@ func testQuery(t *testing.T, md *MongoDump, session *mongo.Client) string {
 	path, err := os.Getwd()
 	So(err, ShouldBeNil)
 
-	dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-	dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
+	dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+	dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
 	So(fileDirExists(dumpDir), ShouldBeTrue)
 	So(fileDirExists(dumpDBDir), ShouldBeTrue)
 
@@ -537,11 +525,11 @@ func testDumpOneCollection(t *testing.T, md *MongoDump, dumpDir string) {
 	path, err := os.Getwd()
 	So(err, ShouldBeNil)
 
-	absDumpDir := util.ToUniversalPath(filepath.Join(path, dumpDir))
+	absDumpDir := filepath.FromSlash(filepath.Join(path, dumpDir))
 	So(os.RemoveAll(absDumpDir), ShouldBeNil)
 	So(fileDirExists(absDumpDir), ShouldBeFalse)
 
-	dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
+	dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
 	So(fileDirExists(dumpDBDir), ShouldBeFalse)
 
 	md.OutputOptions.Out = dumpDir
@@ -549,10 +537,10 @@ func testDumpOneCollection(t *testing.T, md *MongoDump, dumpDir string) {
 	So(err, ShouldBeNil)
 	So(fileDirExists(dumpDBDir), ShouldBeTrue)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	So(err, ShouldBeNil)
 
-	countColls, err := countNonIndexBSONFiles(dumpDBDir)
+	countColls, err := countBSONFiles(dumpDBDir)
 	So(err, ShouldBeNil)
 	So(countColls, ShouldEqual, 1)
 
@@ -593,36 +581,142 @@ func testDumpOneCollection(t *testing.T, md *MongoDump, dumpDir string) {
 func TestMongoDumpValidateOptions(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.UnitTestType)
 
-	t.Run("no db", func(t *testing.T) {
-		md, err := simpleMongoDumpInstance()
-		require.NoError(t, err)
-		md.ToolOptions.Collection = "some_collection"
-		md.ToolOptions.DB = ""
+	for _, testCase := range invalidDumpOptionsCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			md, err := simpleMongoDumpInstance()
+			require.NoError(t, err)
 
-		err = md.ValidateOptions()
-		require.Error(t, err)
-		assert.ErrorContains(
-			t,
-			err,
-			"cannot dump a collection without a specified database",
-		)
-	})
+			testCase.setUp(md)
 
-	t.Run("no collection name with query", func(t *testing.T) {
-		md, err := simpleMongoDumpInstance()
-		require.NoError(t, err)
+			assert.ErrorContains(
+				t,
+				md.ValidateOptions(),
+				testCase.wantErr,
+				"mongodump rejects %s",
+				testCase.name,
+			)
+		})
+	}
+}
 
-		md.ToolOptions.Collection = ""
-		md.InputOptions.Query = "{_id:\"\"}"
+type invalidDumpOptionsCase struct {
+	name    string
+	setUp   func(*MongoDump)
+	wantErr string
+}
 
-		err = md.ValidateOptions()
-		require.Error(t, err)
-		assert.ErrorContains(
-			t,
-			err,
-			"cannot dump using a query without a specified collection",
-		)
-	})
+// invalidDumpOptionsCases collects the option combinations mongodump rejects. Each case asserts on
+// the error validation returns, rather than on a process exit code, so it pins down which
+// combination was rejected and why.
+var invalidDumpOptionsCases = []invalidDumpOptionsCase{
+	{
+		name: "a collection without a db",
+		setUp: func(md *MongoDump) {
+			md.ToolOptions.DB = ""
+			md.ToolOptions.Collection = "some_collection"
+		},
+		wantErr: "cannot dump a collection without a specified database",
+	},
+	{
+		name: "a query without a collection",
+		setUp: func(md *MongoDump) {
+			md.ToolOptions.Collection = ""
+			md.InputOptions.Query = `{"_id": ""}`
+		},
+		wantErr: "cannot dump using a query without a specified collection",
+	},
+	{
+		name: "dumping to stdout without a collection",
+		setUp: func(md *MongoDump) {
+			md.OutputOptions.Out = "-"
+			md.ToolOptions.DB = "foo"
+			md.ToolOptions.Collection = ""
+		},
+		wantErr: "can only dump a single collection to stdout",
+	},
+	{
+		name: "queryFile without a collection",
+		setUp: func(md *MongoDump) {
+			md.ToolOptions.DB = "foo"
+			md.ToolOptions.Collection = ""
+			md.InputOptions.QueryFile = "query.json"
+		},
+		wantErr: "cannot dump using a queryFile without a specified collection",
+	},
+	{
+		name: "query together with queryFile",
+		setUp: func(md *MongoDump) {
+			md.ToolOptions.DB = "foo"
+			md.ToolOptions.Collection = "bar"
+			md.InputOptions.Query = `{"x": 1}`
+			md.InputOptions.QueryFile = "query.json"
+		},
+		wantErr: "either query or queryFile can be specified as a query option, not both",
+	},
+	{
+		name: "forceTableScan together with a query",
+		setUp: func(md *MongoDump) {
+			md.ToolOptions.DB = "foo"
+			md.ToolOptions.Collection = "bar"
+			md.InputOptions.Query = `{"x": 1}`
+			md.InputOptions.TableScan = true
+		},
+		wantErr: "cannot use --forceTableScan when specifying --query",
+	},
+	{
+		name: "excludeCollection without a db",
+		setUp: func(md *MongoDump) {
+			md.ToolOptions.DB = ""
+			md.ToolOptions.Collection = ""
+			md.OutputOptions.ExcludedCollections = []string{"baz"}
+		},
+		wantErr: "--db is required when --excludeCollection is specified",
+	},
+	{
+		name: "excludeCollection together with a collection",
+		setUp: func(md *MongoDump) {
+			md.ToolOptions.DB = "foo"
+			md.ToolOptions.Collection = "baz"
+			md.OutputOptions.ExcludedCollections = []string{"baz"}
+		},
+		wantErr: "--collection is not allowed when --excludeCollection is specified",
+	},
+	{
+		name: "excludeCollectionsWithPrefix without a db",
+		setUp: func(md *MongoDump) {
+			md.ToolOptions.DB = ""
+			md.ToolOptions.Collection = ""
+			md.OutputOptions.ExcludedCollectionPrefixes = []string{"baz"}
+		},
+		wantErr: "--db is required when --excludeCollectionsWithPrefix is specified",
+	},
+	{
+		name: "excludeCollectionsWithPrefix together with a collection",
+		setUp: func(md *MongoDump) {
+			md.ToolOptions.DB = "foo"
+			md.ToolOptions.Collection = "baz"
+			md.OutputOptions.ExcludedCollectionPrefixes = []string{"baz"}
+		},
+		wantErr: "--collection is not allowed when --excludeCollectionsWithPrefix is specified",
+	},
+}
+
+// TestMongoDumpQueryFileMissing covers the one query-flag failure that is not an
+// option-validation error: the file is only opened when the query is read.
+func TestMongoDumpQueryFileMissing(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.UnitTestType)
+
+	inputOptions := &InputOptions{
+		QueryFile: filepath.Join(t.TempDir(), "does-not-exist.json"),
+	}
+
+	_, err := inputOptions.GetQuery()
+	assert.ErrorContains(
+		t,
+		err,
+		"error reading queryFile",
+		"a --queryFile that does not exist is reported when the query is read",
+	)
 }
 
 func TestMongoDumpConnectedToAtlasProxy(t *testing.T) {
@@ -630,7 +724,7 @@ func TestMongoDumpConnectedToAtlasProxy(t *testing.T) {
 
 	log.SetWriter(io.Discard)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err)
 	defer sessionProvider.Close()
 
@@ -750,12 +844,12 @@ func TestMongoDumpBSON(t *testing.T) {
 							path, err := os.Getwd()
 							So(err, ShouldBeNil)
 
-							dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-							dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
+							dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+							dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
 							So(fileDirExists(dumpDir), ShouldBeTrue)
 							So(fileDirExists(dumpDBDir), ShouldBeTrue)
 
-							countColls, err := countNonIndexBSONFiles(dumpDBDir)
+							countColls, err := countBSONFiles(dumpDBDir)
 							So(err, ShouldBeNil)
 							So(countColls, ShouldEqual, len(testCollectionNames))
 
@@ -777,8 +871,8 @@ func TestMongoDumpBSON(t *testing.T) {
 							path, err := os.Getwd()
 							So(err, ShouldBeNil)
 
-							dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-							dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, "nottestdb"))
+							dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+							dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, "nottestdb"))
 
 							So(fileDirExists(dumpDir), ShouldBeFalse)
 							So(fileDirExists(dumpDBDir), ShouldBeFalse)
@@ -792,7 +886,7 @@ func TestMongoDumpBSON(t *testing.T) {
 		Convey(
 			"testing that using MongoDump WITH a query dumps a subset of documents in a database and/or collection",
 			func() {
-				session, err := testutil.GetBareSession()
+				session, err := testutil.GetBareSession(t)
 				So(err, ShouldBeNil)
 				md, err := simpleMongoDumpInstance()
 				So(err, ShouldBeNil)
@@ -860,7 +954,7 @@ func TestMongoDumpBSONLongCollectionName(t *testing.T) {
 
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -894,11 +988,11 @@ func TestMongoDumpBSONLongCollectionName(t *testing.T) {
 				path, err := os.Getwd()
 				So(err, ShouldBeNil)
 
-				absDumpDir := util.ToUniversalPath(filepath.Join(path, "dump_slash"))
+				absDumpDir := filepath.FromSlash(filepath.Join(path, "dump_slash"))
 				So(os.RemoveAll(absDumpDir), ShouldBeNil)
 				So(fileDirExists(absDumpDir), ShouldBeFalse)
 
-				dumpDBDir := util.ToUniversalPath(filepath.Join("dump_slash", testDB))
+				dumpDBDir := filepath.FromSlash(filepath.Join("dump_slash", testDB))
 				So(fileDirExists(dumpDBDir), ShouldBeFalse)
 
 				md.OutputOptions.Out = "dump_slash"
@@ -908,7 +1002,7 @@ func TestMongoDumpBSONLongCollectionName(t *testing.T) {
 
 				Convey("to a bson file", func() {
 					oneBsonFile, err := os.Open(
-						util.ToUniversalPath(filepath.Join(dumpDBDir, longBsonName)),
+						filepath.FromSlash(filepath.Join(dumpDBDir, longBsonName)),
 					)
 					So(err, ShouldBeNil)
 					oneBsonFile.Close()
@@ -916,7 +1010,7 @@ func TestMongoDumpBSONLongCollectionName(t *testing.T) {
 
 				Convey("to a metadata file", func() {
 					oneMetaFile, err := os.Open(
-						util.ToUniversalPath(filepath.Join(dumpDBDir, longMetadataName)),
+						filepath.FromSlash(filepath.Join(dumpDBDir, longMetadataName)),
 					)
 					So(err, ShouldBeNil)
 					oneMetaFile.Close()
@@ -944,7 +1038,7 @@ func testPreludeMetadata(md *MongoDump, dir string, serverVersion string) {
 	}
 	So(fileDirExists(preludeFilepath), ShouldBeTrue)
 	var reader io.Reader
-	preludeFile, err := os.Open(util.ToUniversalPath(preludeFilepath))
+	preludeFile, err := os.Open(filepath.FromSlash(preludeFilepath))
 	So(err, ShouldBeNil)
 	reader = preludeFile
 	defer preludeFile.Close()
@@ -973,7 +1067,7 @@ func TestDumpPreludeMetadataJson(t *testing.T) {
 		err = setUpMongoDumpTestData(t)
 		So(err, ShouldBeNil)
 
-		sessionProvider, _, _ := testutil.GetBareSessionProvider()
+		sessionProvider, _, _ := testutil.GetBareSessionProvider(t)
 		So(sessionProvider, ShouldNotBeNil)
 		serverVersion, err := sessionProvider.ServerVersion()
 		So(err, ShouldBeNil)
@@ -986,7 +1080,7 @@ func TestDumpPreludeMetadataJson(t *testing.T) {
 			md.ToolOptions.Collection = ""
 
 			Convey("when dumping to the default directory", func() {
-				dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
+				dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
 				So(os.RemoveAll(dumpDir), ShouldBeNil)
 
 				Convey("writes prelude.json to dump directory", func() {
@@ -1004,7 +1098,7 @@ func TestDumpPreludeMetadataJson(t *testing.T) {
 			})
 
 			Convey("when output directory is specified", func() {
-				dumpDir := util.ToUniversalPath(filepath.Join(path, "dump_output"))
+				dumpDir := filepath.FromSlash(filepath.Join(path, "dump_output"))
 				So(os.RemoveAll(dumpDir), ShouldBeNil)
 
 				Convey("writes prelude.json to output directory", func() {
@@ -1022,8 +1116,8 @@ func TestDumpPreludeMetadataJson(t *testing.T) {
 			md, err := simpleMongoDumpInstance()
 			So(err, ShouldBeNil)
 
-			dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-			dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
+			dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+			dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
 			So(os.RemoveAll(dumpDir), ShouldBeNil)
 
 			Convey("writes prelude.json to dump directory", func() {
@@ -1037,8 +1131,8 @@ func TestDumpPreludeMetadataJson(t *testing.T) {
 
 		Convey("when the dump directory is not created", func() {
 
-			dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-			dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, "nottestdb"))
+			dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+			dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, "nottestdb"))
 
 			Convey("the dump does not fail and prelude.json should not be created", func() {
 				md, err := simpleMongoDumpInstance()
@@ -1074,7 +1168,7 @@ func TestMongoDumpMetaData(t *testing.T) {
 	log.SetWriter(io.Discard)
 
 	Convey("With a MongoDump instance", t, func() {
-		session, err := testutil.GetBareSession()
+		session, err := testutil.GetBareSession(t)
 		So(session, ShouldNotBeNil)
 		So(err, ShouldBeNil)
 
@@ -1095,13 +1189,13 @@ func TestMongoDumpMetaData(t *testing.T) {
 
 			path, err := os.Getwd()
 			So(err, ShouldBeNil)
-			dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-			dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
+			dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+			dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
 			So(fileDirExists(dumpDir), ShouldBeTrue)
 			So(fileDirExists(dumpDBDir), ShouldBeTrue)
 
 			Convey("having one metadata file per collection", func() {
-				c1, err := countNonIndexBSONFiles(dumpDBDir)
+				c1, err := countBSONFiles(dumpDBDir)
 				So(err, ShouldBeNil)
 
 				c2, err := countMetaDataFiles(dumpDBDir)
@@ -1115,7 +1209,7 @@ func TestMongoDumpMetaData(t *testing.T) {
 					So(len(metaFiles), ShouldBeGreaterThan, 0)
 
 					oneMetaFile, err := os.Open(
-						util.ToUniversalPath(filepath.Join(dumpDBDir, metaFiles[0])),
+						filepath.FromSlash(filepath.Join(dumpDBDir, metaFiles[0])),
 					)
 					defer oneMetaFile.Close()
 					So(err, ShouldBeNil)
@@ -1174,7 +1268,7 @@ func TestMongoDumpOplog(t *testing.T) {
 	t.Skip()
 
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1195,8 +1289,8 @@ func TestMongoDumpOplog(t *testing.T) {
 			path, err := os.Getwd()
 			So(err, ShouldBeNil)
 
-			dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-			dumpOplogFile := util.ToUniversalPath(filepath.Join(dumpDir, "oplog.bson"))
+			dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+			dumpOplogFile := filepath.FromSlash(filepath.Join(dumpDir, "oplog.bson"))
 
 			err = os.RemoveAll(dumpDir)
 			So(err, ShouldBeNil)
@@ -1270,7 +1364,7 @@ func TestMongoDumpTOOLS2174(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	log.SetWriter(io.Discard)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1325,9 +1419,13 @@ func TestMongoDumpTOOLS2174(t *testing.T) {
 // Test dumping a collection while respecting no index scan for wired tiger.
 func TestMongoDumpTOOLS1952(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it reads system.profile, and DSC does not support profile level 2",
+	)
 	log.SetWriter(io.Discard)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1363,7 +1461,7 @@ func TestMongoDumpTOOLS1952(t *testing.T) {
 	}
 
 	// Turn on profiling.
-	if err = turnOnProfiling(dbName); err != nil {
+	if err = turnOnProfiling(t, dbName); err != nil {
 		t.Fatalf("Failed to turn on profiling: %v", err)
 	}
 
@@ -1394,7 +1492,7 @@ func TestMongoDumpTOOLS2498(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	log.SetWriter(io.Discard)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1430,27 +1528,24 @@ func TestMongoDumpTOOLS2498(t *testing.T) {
 		err = md.Init()
 		So(err, ShouldBeNil)
 
-		failpoint.ParseFailpoints("PauseBeforeDumping")
-		defer failpoint.Reset()
+		require.NoError(t, failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()))
+		defer failpoint.DefaultManager.Reset()
 
-		var disconnectErr error
-		canCheckErr := make(chan struct{})
-		// with the failpoint PauseBeforeDumping, Mongodump will pause 15 seconds before starting dumping. We will close the connection
-		// during this period. Before the fix, the process will panic with Nil pointer error since it fails to getCollectionInfo.
-		go func() {
-			time.Sleep(2 * time.Second)
-			session, _ := md.SessionProvider.GetSession()
-			disconnectErr = session.Disconnect(t.Context())
-			close(canCheckErr)
-		}()
+		dumpErrCh := make(chan error, 1)
+		go func() { dumpErrCh <- md.Dump() }()
 
-		err = md.Dump()
-		// Mongodump should not panic, but return correct error if failed to getCollectionInfo
+		fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+		So(ok, ShouldBeTrue)
+		require.NoError(t, fp.Reached(context.TODO()))
+		session, _ := md.SessionProvider.GetSession()
+		disconnectErr := session.Disconnect(t.Context())
+		So(disconnectErr, ShouldBeNil)
+		fp.Signal()
+
+		err = <-dumpErrCh
+		// Mongodump should not panic, but return correct the error if getCollectionInfo failed.
 		So(err, ShouldNotBeNil)
 		So(err.Error(), ShouldContainSubstring, "client is disconnected")
-
-		<-canCheckErr
-		So(disconnectErr, ShouldBeNil)
 	})
 }
 
@@ -1463,12 +1558,12 @@ func TestMongoDumpOrderedQuery(t *testing.T) {
 		So(err, ShouldBeNil)
 		path, err := os.Getwd()
 		So(err, ShouldBeNil)
-		dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
+		dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
 
 		Convey("testing that --query is order-preserving", func() {
-			// If order is not preserved, probabalistically, some of these
+			// If order is not preserved, probabilistically, some of these
 			// loops will fail.
-			for i := 0; i < 100; i++ {
+			for range 100 {
 				So(os.RemoveAll(dumpDir), ShouldBeNil)
 
 				md, err := simpleMongoDumpInstance()
@@ -1483,7 +1578,7 @@ func TestMongoDumpOrderedQuery(t *testing.T) {
 				err = md.Dump()
 				So(err, ShouldBeNil)
 
-				dumpBSON := util.ToUniversalPath(
+				dumpBSON := filepath.FromSlash(
 					filepath.Join(dumpDir, testDB, testCollectionNames[0]+".bson"),
 				)
 
@@ -1515,6 +1610,10 @@ func TestMongoDumpOrderedQuery(t *testing.T) {
 
 func TestMongoDumpViewsAsCollections(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it reads system.profile, and DSC does not support profile level 2",
+	)
 	log.SetWriter(io.Discard)
 
 	Convey("With a MongoDump instance", t, func() {
@@ -1523,10 +1622,10 @@ func TestMongoDumpViewsAsCollections(t *testing.T) {
 
 		colName := "dump_view_as_collection"
 		dbName := testDB
-		err = setUpDBView(dbName, colName)
+		err = setUpDBView(t, dbName, colName)
 		So(err, ShouldBeNil)
 
-		err = turnOnProfiling(testDB)
+		err = turnOnProfiling(t, testDB)
 		So(err, ShouldBeNil)
 
 		Convey("testing that the dumped directory contains information about metadata", func() {
@@ -1546,13 +1645,13 @@ func TestMongoDumpViewsAsCollections(t *testing.T) {
 			path, err := os.Getwd()
 			So(err, ShouldBeNil)
 
-			dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-			dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
+			dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+			dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
 			So(fileDirExists(dumpDir), ShouldBeTrue)
 			So(fileDirExists(dumpDBDir), ShouldBeTrue)
 
 			Convey("having one metadata file per read-only view", func() {
-				c1, err := countNonIndexBSONFiles(dumpDBDir)
+				c1, err := countBSONFiles(dumpDBDir)
 				So(err, ShouldBeNil)
 
 				c2, err := countMetaDataFiles(dumpDBDir)
@@ -1563,7 +1662,7 @@ func TestMongoDumpViewsAsCollections(t *testing.T) {
 			})
 
 			Convey("testing dumping a view, we should not hint index", func() {
-				session, err := testutil.GetBareSession()
+				session, err := testutil.GetBareSession(t)
 				So(err, ShouldBeNil)
 
 				dbStruct := session.Database(dbName)
@@ -1598,7 +1697,7 @@ func TestMongoDumpViews(t *testing.T) {
 
 		colName := "dump_views"
 		dbName := testDB
-		err = setUpDBView(dbName, colName)
+		err = setUpDBView(t, dbName, colName)
 		So(err, ShouldBeNil)
 
 		Convey("testing that the dumped directory contains information about metadata", func() {
@@ -1618,8 +1717,8 @@ func TestMongoDumpViews(t *testing.T) {
 			path, err := os.Getwd()
 			So(err, ShouldBeNil)
 
-			dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-			dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
+			dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+			dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
 			So(fileDirExists(dumpDir), ShouldBeTrue)
 			So(fileDirExists(dumpDBDir), ShouldBeTrue)
 
@@ -1633,7 +1732,7 @@ func TestMongoDumpViews(t *testing.T) {
 			})
 
 			Convey("testing dumping a view, we should not hint index", func() {
-				session, err := testutil.GetBareSession()
+				session, err := testutil.GetBareSession(t)
 				So(err, ShouldBeNil)
 
 				dbStruct := session.Database(dbName)
@@ -1732,7 +1831,7 @@ func TestMongoDumpCollectionOutputPath(t *testing.T) {
 			assert.Len(t, fileComponents, 3)
 
 			filePath := fileComponents[len(fileComponents)-1]
-			assert.Equal(t, util.EscapeCollectionName(colName)[:208]+"%24", filePath[:211])
+			assert.Equal(t, url.QueryEscape(colName)[:208]+"%24", filePath[:211])
 
 			hashDecoded, _ := base64.RawURLEncoding.DecodeString(filePath[211:])
 			hash := sha1.Sum([]byte(colName))
@@ -1748,7 +1847,7 @@ func TestCount(t *testing.T) {
 		err := setUpMongoDumpTestData(t)
 		So(err, ShouldBeNil)
 
-		session, err := testutil.GetBareSession()
+		session, err := testutil.GetBareSession(t)
 		So(err, ShouldBeNil)
 
 		collection := session.Database(testDB).Collection(testCollectionNames[0])
@@ -1792,7 +1891,7 @@ func TestCount(t *testing.T) {
 func TestTimeseriesCollections(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	require.NoError(t, err, "get session")
 
 	fcv := testutil.GetFCV(session)
@@ -1800,7 +1899,7 @@ func TestTimeseriesCollections(t *testing.T) {
 		t.Skipf("Requires server with FCV 5.0 or later; found %v", fcv)
 	}
 
-	sp, _, err := testutil.GetBareSessionProvider()
+	sp, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err, "get session provider")
 
 	serverVersion, err := sp.ServerVersionArray()
@@ -1845,7 +1944,7 @@ func TestTimeseriesCollections(t *testing.T) {
 			path, err := os.Getwd()
 			require.NoError(t, err)
 
-			archiveFilePath := util.ToUniversalPath(filepath.Join(path, "dump.archive"))
+			archiveFilePath := filepath.FromSlash(filepath.Join(path, "dump.archive"))
 
 			archiveFile, err := os.Open(archiveFilePath)
 			require.NoError(t, err)
@@ -1934,14 +2033,14 @@ func TestTimeseriesCollections(t *testing.T) {
 			path, err := os.Getwd()
 			require.NoError(t, err)
 
-			dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-			dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, dbName))
-			metadataFile := util.ToUniversalPath(
+			dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+			dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, dbName))
+			metadataFile := filepath.FromSlash(
 				filepath.Join(dumpDBDir, colName+".metadata.json"),
 			)
 
 			expectedCollFile := timeseriesCollName(serverVersion, colName)
-			bsonFile := util.ToUniversalPath(
+			bsonFile := filepath.FromSlash(
 				filepath.Join(dumpDBDir, expectedCollFile+".bson"),
 			)
 			assert.True(t, fileDirExists(dumpDir))
@@ -1996,7 +2095,7 @@ func TestTimeseriesCollections(t *testing.T) {
 			path, err := os.Getwd()
 			require.NoError(t, err)
 
-			archiveFilePath := util.ToUniversalPath(filepath.Join(path, "dump.archive"))
+			archiveFilePath := filepath.FromSlash(filepath.Join(path, "dump.archive"))
 
 			archiveFile, err := os.Open(archiveFilePath)
 			require.NoError(t, err)
@@ -2039,7 +2138,7 @@ func TestTimeseriesCollections(t *testing.T) {
 			path, err := os.Getwd()
 			require.NoError(t, err)
 
-			dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
+			dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
 			assert.False(t, fileDirExists(dumpDir))
 
 			require.NoError(t, os.RemoveAll(dumpDir))
@@ -2084,12 +2183,12 @@ func TestTimeseriesCollections(t *testing.T) {
 			path, err := os.Getwd()
 			require.NoError(t, err)
 
-			dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-			dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, dbName))
-			metadataFile := util.ToUniversalPath(
+			dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+			dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, dbName))
+			metadataFile := filepath.FromSlash(
 				filepath.Join(dumpDBDir, colName+".metadata.json"),
 			)
-			bsonFile := util.ToUniversalPath(
+			bsonFile := filepath.FromSlash(
 				filepath.Join(dumpDBDir, timeseriesCollName(serverVersion, colName)+".bson"),
 			)
 			assert.True(t, fileDirExists(dumpDir))
@@ -2185,7 +2284,7 @@ func TestTimeseriesCollections(t *testing.T) {
 func TestDumpTimeseriesCollectionsWithMixedSchema(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	require.NoError(t, err, "get session")
 
 	fcv := testutil.GetFCV(session)
@@ -2193,7 +2292,7 @@ func TestDumpTimeseriesCollectionsWithMixedSchema(t *testing.T) {
 		t.Skipf("Requires server with FCV 5.0 or later; found %v", fcv)
 	}
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err, "get session provider")
 
 	serverVersion, err := sessionProvider.ServerVersionArray()
@@ -2219,7 +2318,7 @@ func TestDumpTimeseriesCollectionsWithMixedSchema(t *testing.T) {
 	path, err := os.Getwd()
 	require.NoError(t, err)
 
-	archiveFilePath := util.ToUniversalPath(filepath.Join(path, "dump.archive"))
+	archiveFilePath := filepath.FromSlash(filepath.Join(path, "dump.archive"))
 
 	archiveFile, err := os.Open(archiveFilePath)
 	require.NoError(t, err)
@@ -2273,7 +2372,7 @@ func TestFailDuringResharding(t *testing.T) {
 		"this test requires permissions that may not be available for an Atlas cluster",
 	)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("Failed to get session provider: %v", err)
 	}
@@ -2355,17 +2454,20 @@ func TestFailDuringResharding(t *testing.T) {
 		)
 
 		Convey("dump should fail if config.reshardingOperations created in oplog", func() {
-			failpoint.ParseFailpoints("PauseBeforeDumping")
-			defer failpoint.Reset()
+			require.NoError(t, failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()))
+			defer failpoint.DefaultManager.Reset()
 
-			var sessErr1, sessErr2 error
-			go func() {
-				time.Sleep(2 * time.Second)
-				sessErr1 = session.Database("config").CreateCollection(ctx, "reshardingOperations")
-				sessErr2 = session.Database("config").Collection("reshardingOperations").Drop(ctx)
-			}()
+			dumpErrCh := make(chan error, 1)
+			go func() { dumpErrCh <- md.Dump() }()
 
-			err = md.Dump()
+			fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+			So(ok, ShouldBeTrue)
+			require.NoError(t, fp.Reached(context.TODO()))
+			sessErr1 := session.Database("config").CreateCollection(ctx, "reshardingOperations")
+			sessErr2 := session.Database("config").Collection("reshardingOperations").Drop(ctx)
+			fp.Signal()
+
+			err = <-dumpErrCh
 
 			So(err, ShouldNotBeNil)
 			So(err.Error(), ShouldContainSubstring, OplogErrorMsg)
@@ -2376,20 +2478,26 @@ func TestFailDuringResharding(t *testing.T) {
 		Convey(
 			"dump should fail if config.localReshardingOperations.donor created in oplog",
 			func() {
-				failpoint.ParseFailpoints("PauseBeforeDumping")
-				defer failpoint.Reset()
+				require.NoError(
+					t,
+					failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()),
+				)
+				defer failpoint.DefaultManager.Reset()
 
-				var sessErr1, sessErr2 error
-				go func() {
-					time.Sleep(2 * time.Second)
-					sessErr1 = session.Database("config").
-						CreateCollection(ctx, "localReshardingOperations.donor")
-					sessErr2 = session.Database("config").
-						Collection("localReshardingOperations.donor").
-						Drop(ctx)
-				}()
+				dumpErrCh := make(chan error, 1)
+				go func() { dumpErrCh <- md.Dump() }()
 
-				err = md.Dump()
+				fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+				So(ok, ShouldBeTrue)
+				require.NoError(t, fp.Reached(context.TODO()))
+				sessErr1 := session.Database("config").
+					CreateCollection(ctx, "localReshardingOperations.donor")
+				sessErr2 := session.Database("config").
+					Collection("localReshardingOperations.donor").
+					Drop(ctx)
+				fp.Signal()
+
+				err = <-dumpErrCh
 
 				So(err, ShouldNotBeNil)
 				So(err.Error(), ShouldContainSubstring, OplogErrorMsg)
@@ -2401,20 +2509,26 @@ func TestFailDuringResharding(t *testing.T) {
 		Convey(
 			"dump should fail if config.localReshardingOperations.recipient created in oplog",
 			func() {
-				failpoint.ParseFailpoints("PauseBeforeDumping")
-				defer failpoint.Reset()
+				require.NoError(
+					t,
+					failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()),
+				)
+				defer failpoint.DefaultManager.Reset()
 
-				var sessErr1, sessErr2 error
-				go func() {
-					time.Sleep(2 * time.Second)
-					sessErr1 = session.Database("config").
-						CreateCollection(ctx, "localReshardingOperations.recipient")
-					sessErr2 = session.Database("config").
-						Collection("localReshardingOperations.recipient").
-						Drop(ctx)
-				}()
+				dumpErrCh := make(chan error, 1)
+				go func() { dumpErrCh <- md.Dump() }()
 
-				err = md.Dump()
+				fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+				So(ok, ShouldBeTrue)
+				require.NoError(t, fp.Reached(context.TODO()))
+				sessErr1 := session.Database("config").
+					CreateCollection(ctx, "localReshardingOperations.recipient")
+				sessErr2 := session.Database("config").
+					Collection("localReshardingOperations.recipient").
+					Drop(ctx)
+				fp.Signal()
+
+				err = <-dumpErrCh
 
 				So(err, ShouldNotBeNil)
 				So(err.Error(), ShouldContainSubstring, OplogErrorMsg)
@@ -2430,7 +2544,7 @@ func TestOptionsOrderIsPreserved(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	log.SetWriter(io.Discard)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err)
 
 	collName := "students"
@@ -2469,7 +2583,7 @@ func TestOptionsOrderIsPreserved(t *testing.T) {
 
 	// The check should be run a few times due to the probabilistic nature
 	// of TOOLS-3411
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		dumpAndCheckPipelineOrder(t, collName, pipeline)
 	}
 
@@ -2490,8 +2604,8 @@ func dumpAndCheckPipelineOrder(t *testing.T, collName string, pipeline bson.A) {
 	path, err := os.Getwd()
 	require.NoError(t, err)
 
-	dumpDir := util.ToUniversalPath(filepath.Join(path, "dump"))
-	dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
+	dumpDir := filepath.FromSlash(filepath.Join(path, "dump"))
+	dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
 	require.True(t, fileDirExists(dumpDir))
 	require.True(t, fileDirExists(dumpDBDir))
 
@@ -2499,7 +2613,7 @@ func dumpAndCheckPipelineOrder(t *testing.T, collName string, pipeline bson.A) {
 	require.NoError(t, err)
 	require.Equal(t, len(metaFiles), 1)
 
-	metaFile, err := os.Open(util.ToUniversalPath(filepath.Join(dumpDBDir, metaFiles[0])))
+	metaFile, err := os.Open(filepath.FromSlash(filepath.Join(dumpDBDir, metaFiles[0])))
 
 	require.NoError(t, err)
 	contents, err := io.ReadAll(metaFile)
@@ -2530,7 +2644,7 @@ func TestBrokenPipe(t *testing.T) {
 		collName = "docs"
 	)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err)
 	client, err := sessionProvider.GetSession()
 	require.NoError(t, err)
@@ -2548,8 +2662,356 @@ func TestBrokenPipe(t *testing.T) {
 
 	args := append(
 		[]string{"run", filepath.Join("..", "mongodump", "main")},
-		testutil.GetBareArgs()...,
+		testopts.GetBareArgs()...,
 	)
 	args = append(args, "--db", dbName, "--archive=-")
 	testutil.AssertBrokenPipeHandled(t, exec.Command("go", args...))
+}
+
+// TestMongoDumpMaxEstimatedScanBytes verifies that mongodump can dump a collection larger than the
+// server's maxEstimatedScanBytes threshold (SERVER-127688, added in 9.0). An unfiltered dump plans
+// an unbounded COLLSCAN, which the server rejects with NoQueryExecutionPlans unless the query
+// carries a $natural hint. The view case additionally covers the count that mongodump issues
+// before dumping, which goes through CountDocuments rather than the find.
+func TestMongoDumpMaxEstimatedScanBytes(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	log.SetWriter(io.Discard)
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
+	require.NoError(t, err, "get session provider")
+	defer sessionProvider.Close()
+
+	serverVersion, err := sessionProvider.ServerVersionArray()
+	require.NoError(t, err, "get server version")
+	if serverVersion.LT(db.Version{9, 0, 0}) {
+		t.Skipf("maxEstimatedScanBytes was added in 9.0; testing with %s", serverVersion.String())
+	}
+
+	// setParameter on a mongos does not reach the shards, so the knob would never be applied to
+	// the nodes that actually plan the query.
+	isMongos, err := sessionProvider.IsMongos()
+	require.NoError(t, err, "check for mongos")
+	if isMongos {
+		t.Skip("setParameter does not propagate from mongos to shards")
+	}
+
+	session, err := sessionProvider.GetSession()
+	require.NoError(t, err, "get session")
+
+	const collName = "max_estimated_scan_bytes"
+	const viewName = "max_estimated_scan_bytes_view"
+	const numDocs = 100
+
+	coll := session.Database(testDB).Collection(collName)
+	require.NoError(t, coll.Drop(t.Context()), "drop existing collection")
+	_ = session.Database(testDB).Collection(viewName).Drop(t.Context())
+
+	docs := make([]any, numDocs)
+	for i := range docs {
+		docs[i] = bson.D{{"_id", i}, {"pad", strings.Repeat("x", 1024)}}
+	}
+	_, err = coll.InsertMany(t.Context(), docs)
+	require.NoError(t, err, "insert test documents")
+
+	err = session.Database(testDB).
+		CreateView(t.Context(), viewName, collName, mongo.Pipeline{})
+	require.NoError(t, err, "create view")
+
+	// The collection is ~100KB, so any threshold well below that triggers the rejection.
+	setKnob := func(value any) {
+		var res bson.M
+		err := sessionProvider.Run(
+			bson.D{{"setParameter", 1}, {"maxEstimatedScanBytes", value}},
+			&res,
+			"admin",
+		)
+		require.NoError(t, err, "set maxEstimatedScanBytes to %v", value)
+	}
+	setKnob(int64(1024))
+	defer setKnob(int64(-1))
+
+	countDumpedDocs := func(t *testing.T, dumpDir, name string) int {
+		file, err := os.Open(filepath.Join(dumpDir, testDB, name+".bson"))
+		require.NoError(t, err, "open dumped %s", name)
+		defer file.Close()
+
+		bsonSource := db.NewDecodedBSONSource(db.NewBSONSource(file))
+		defer bsonSource.Close()
+
+		count := 0
+		var result bson.D
+		for bsonSource.Next(&result) {
+			count++
+		}
+		require.NoError(t, bsonSource.Err(), "read dumped %s", name)
+		return count
+	}
+
+	// --viewsAsCollections omits standard collections, so the find path and the count path need
+	// separate dumps.
+	t.Run("collection", func(t *testing.T) {
+		dumpDir, cleanupDir := testutil.MakeTempDir(t)
+		defer cleanupDir()
+
+		md, err := simpleMongoDumpInstance()
+		require.NoError(t, err, "create mongodump instance")
+		md.OutputOptions.Out = dumpDir
+		require.NoError(t, md.Init(), "mongodump init")
+		require.NoError(t, md.Dump(), "dump a collection larger than maxEstimatedScanBytes")
+
+		assert.Equal(
+			t,
+			numDocs,
+			countDumpedDocs(t, dumpDir, collName),
+			"all documents were dumped from the collection",
+		)
+	})
+
+	t.Run("view", func(t *testing.T) {
+		dumpDir, cleanupDir := testutil.MakeTempDir(t)
+		defer cleanupDir()
+
+		md, err := simpleMongoDumpInstance()
+		require.NoError(t, err, "create mongodump instance")
+		md.OutputOptions.Out = dumpDir
+		md.OutputOptions.ViewsAsCollections = true
+		require.NoError(t, md.Init(), "mongodump init")
+		require.NoError(
+			t,
+			md.Dump(),
+			"dump a view over a collection larger than maxEstimatedScanBytes",
+		)
+
+		assert.Equal(
+			t,
+			numDocs,
+			countDumpedDocs(t, dumpDir, viewName),
+			"all documents were dumped from the view",
+		)
+	})
+}
+
+// TestTimeseriesDumpConcurrentWithSetFCV exercises the open item from the TOOLS-4182
+// investigation: a long-running mongodump that overlaps a setFCV, which on 9.0+ converts
+// timeseries collections between their viewless and viewful forms (SERVER-114505). The
+// server does not currently expect the collection format to change mid-operation, so the
+// point of this test is to pin down that the dump either completes with every measurement
+// or fails outright — it must never silently produce a truncated dump.
+func TestTimeseriesDumpConcurrentWithSetFCV(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	ctx := t.Context()
+
+	session, err := testutil.GetBareSession(t)
+	require.NoError(t, err, "get session")
+
+	sp, _, err := testutil.GetBareSessionProvider(t)
+	require.NoError(t, err, "get session provider")
+
+	serverVersion, err := sp.ServerVersionArray()
+	require.NoError(t, err, "get server version")
+	if serverVersion.LT(db.Version{9, 0, 0}) {
+		t.Skipf(
+			"the viewless timeseries conversion requires a 9.0 server; found %v",
+			serverVersion,
+		)
+	}
+
+	fcv := testutil.GetFCV(session)
+	if cmp, err := testutil.CompareFCV(fcv, "9.0"); err != nil || cmp < 0 {
+		t.Skipf("Requires FCV 9.0 so that setFCV downgrades to a viewful format; found %v", fcv)
+	}
+
+	const dbName = "ts_setfcv_test_DB"
+	const collName = "timeseriesColl"
+	// Enough distinct meta values to produce more buckets than fit in one cursor batch, so
+	// the dump must issue a getMore that we can block on.
+	const numBuckets = 500
+
+	require.NoError(t, session.Database(dbName).Drop(ctx))
+	t.Cleanup(func() { _ = session.Database(dbName).Drop(context.Background()) })
+
+	setUpBucketedTimeseries(t, session, dbName, collName, numBuckets)
+
+	// The failpoint targets this app name only, so the test's own commands — including the
+	// setFCV below — are not blocked.
+	const dumpAppName = "mongodump_setfcv_test"
+
+	md, err := simpleMongoDumpInstance()
+	require.NoError(t, err)
+	md.ToolOptions.DB = dbName
+	md.ToolOptions.AppName = dumpAppName
+	md.OutputOptions.Out = t.TempDir()
+
+	require.NoError(t, md.Init())
+
+	blockGetMoreForAppName(t, session, dumpAppName)
+
+	dumpErr := make(chan error, 1)
+	go func() { dumpErr <- md.Dump() }()
+
+	waitForBlockedGetMore(t, session, dumpAppName)
+
+	// This is the conversion under test: downgrading from 9.0 turns the viewless timeseries
+	// collection back into a view plus a system.buckets collection, underneath the dump.
+	var fcvResult bson.D
+	setFCVErr := session.Database("admin").RunCommand(ctx, bson.D{
+		{"setFeatureCompatibilityVersion", "8.0"},
+		{"confirm", true},
+	}).Decode(&fcvResult)
+	t.Cleanup(func() {
+		_ = session.Database("admin").RunCommand(context.Background(), bson.D{
+			{"setFeatureCompatibilityVersion", "9.0"},
+			{"confirm", true},
+		}).Err()
+	})
+
+	err = <-dumpErr
+
+	// A failed setFCV means the conversion never happened, so there is nothing to assert.
+	require.NoError(t, setFCVErr, "setFCV should succeed while a dump is running")
+
+	if err != nil {
+		// The server interrupts reads whose collection is converted underneath them, and
+		// mongodump surfaces that as a dump failure. Losing the race is the expected outcome;
+		// what matters is that it is reported rather than silently truncating the dump.
+		require.ErrorContains(
+			t,
+			err,
+			"InterruptedDueToTimeseriesUpgradeDowngrade",
+			"a dump interrupted by the conversion should fail with the server's specific error",
+		)
+		return
+	}
+
+	dumped := countDumpedMeasurements(t, filepath.Join(md.OutputOptions.Out, dbName))
+	assert.EqualValues(
+		t,
+		numBuckets,
+		dumped,
+		"a dump that reports success must contain every measurement, even though the "+
+			"collection format changed underneath it",
+	)
+}
+
+// setUpBucketedTimeseries creates a timeseries collection holding one measurement per distinct
+// meta value, so that the collection contains numBuckets buckets.
+func setUpBucketedTimeseries(
+	t *testing.T,
+	session *mongo.Client,
+	dbName, collName string,
+	numBuckets int,
+) {
+	t.Helper()
+
+	ctx := t.Context()
+
+	require.NoError(t, session.Database(dbName).RunCommand(ctx, bson.D{
+		{"create", collName},
+		{"timeseries", bson.D{{"timeField", "ts"}, {"metaField", "my_meta"}}},
+	}).Err(), "create timeseries collection")
+
+	docs := make([]any, 0, numBuckets)
+	for i := range numBuckets {
+		docs = append(docs, bson.D{
+			{"ts", bson.NewDateTimeFromTime(time.Now())},
+			{"my_meta", bson.D{{"device", i}}},
+			{"measurement", i},
+		})
+	}
+
+	_, err := session.Database(dbName).Collection(collName).InsertMany(ctx, docs)
+	require.NoError(t, err, "insert measurements")
+}
+
+// blockGetMoreForAppName makes every getMore from the given app name hang, so that a dump from
+// that app name stays open long enough for a concurrent setFCV to run.
+func blockGetMoreForAppName(t *testing.T, session *mongo.Client, appName string) {
+	t.Helper()
+
+	err := session.Database("admin").RunCommand(t.Context(), bson.D{
+		{"configureFailPoint", "failCommand"},
+		{"mode", "alwaysOn"},
+		{"data", bson.D{
+			{"failCommands", bson.A{"getMore"}},
+			{"appName", appName},
+			{"blockConnection", true},
+			{"blockTimeMS", 10000},
+		}},
+	}).Err()
+
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) && cmdErr.Name == "CommandNotFound" {
+		t.Skip("Requires a server started with enableTestCommands=1")
+	}
+	require.NoError(t, err, "enable the getMore failpoint")
+
+	t.Cleanup(func() {
+		_ = session.Database("admin").RunCommand(context.Background(), bson.D{
+			{"configureFailPoint", "failCommand"},
+			{"mode", "off"},
+		}).Err()
+	})
+}
+
+// waitForBlockedGetMore blocks until the dump's getMore is visible in currentOp, which means
+// the dump is mid-read and it is safe to change the collection format underneath it.
+func waitForBlockedGetMore(t *testing.T, session *mongo.Client, appName string) {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		var result struct {
+			Inprog []bson.D `bson:"inprog"`
+		}
+		err := session.Database("admin").RunCommand(t.Context(), bson.D{
+			{"currentOp", 1},
+			{"appName", appName},
+			{"op", "getmore"},
+		}).Decode(&result)
+		require.NoError(t, err, "run currentOp")
+
+		if len(result.Inprog) > 0 {
+			return
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for a blocked getMore from app name %#q", appName)
+}
+
+// countDumpedMeasurements sums the measurement counts of the bucket documents in the timeseries
+// BSON file in the given dump directory.
+func countDumpedMeasurements(t *testing.T, dumpDir string) int {
+	t.Helper()
+
+	entries, err := os.ReadDir(dumpDir)
+	require.NoError(t, err, "read dump directory")
+
+	total := 0
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".bson") {
+			continue
+		}
+
+		file, err := os.Open(filepath.Join(dumpDir, entry.Name()))
+		require.NoError(t, err)
+		defer file.Close()
+
+		bsonSource := db.NewDecodedBSONSource(db.NewBSONSource(file))
+		defer bsonSource.Close()
+
+		var bucket struct {
+			Control struct {
+				Count int `bson:"count"`
+			} `bson:"control"`
+		}
+		for bsonSource.Next(&bucket) {
+			total += bucket.Control.Count
+		}
+		require.NoError(t, bsonSource.Err(), "read dumped buckets")
+	}
+
+	return total
 }

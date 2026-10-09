@@ -13,8 +13,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/mongodb/mongo-tools/common"
@@ -26,7 +28,6 @@ import (
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/util"
 	"github.com/samber/lo"
-	"golang.org/x/exp/slices"
 )
 
 type NilPos struct{}
@@ -135,7 +136,7 @@ func (f *stdoutFile) Close() error {
 // If you set --db=config then everything is included.
 // If you set --db=config --collection=foo, then shouldSkipSystemNamespace() is
 // never hit since CreateCollectionIntent() is run directly. In this case
-// config.foo will be the olny collection dumped.
+// config.foo will be the only collection dumped.
 func (dump *MongoDump) shouldSkipSystemNamespace(dbName, collName string) bool {
 	// ignore <db>.system.* except for admin; ignore other specific
 	// collections in config and admin databases used for 3.6 features.
@@ -180,10 +181,8 @@ func isReshardingCollection(collName string) bool {
 // shouldSkipCollection returns true when a collection name is excluded
 // by the mongodump options.
 func (dump *MongoDump) shouldSkipCollection(colName string) bool {
-	for _, excludedCollection := range dump.OutputOptions.ExcludedCollections {
-		if colName == excludedCollection {
-			return true
-		}
+	if slices.Contains(dump.OutputOptions.ExcludedCollections, colName) {
+		return true
 	}
 	for _, excludedCollectionPrefix := range dump.OutputOptions.ExcludedCollectionPrefixes {
 		if strings.HasPrefix(colName, excludedCollectionPrefix) {
@@ -206,7 +205,7 @@ func (dump *MongoDump) outputPath(dbName, colName string) string {
 	// than 255 bytes long. This includes the longest possible file extension: .metadata.json.gz
 	// The new format is <truncated-url-encoded-collection-name>%24<collection-name-hash-base64>
 	// where %24 represents a $ symbol delimiter (e.g. aVeryVery...VeryLongName%24oPpXMQ...).
-	escapedColName := util.EscapeCollectionName(colName)
+	escapedColName := url.QueryEscape(colName)
 	if len(escapedColName) > 238 {
 		colNameTruncated := escapedColName[:208]
 		// #nosec G401 -- we do not use this digest algorithm in a security-sensitive way.
@@ -234,7 +233,10 @@ func (dump *MongoDump) CreateOplogIntents() error {
 	if dump.OutputOptions.Archive != "" {
 		oplogIntent.BSONFile = &archive.MuxIn{Mux: dump.archive.Mux, Intent: oplogIntent}
 	} else {
-		oplogIntent.BSONFile = &realBSONFile{path: dump.outputPath("oplog.bson", ""), intent: oplogIntent}
+		oplogIntent.BSONFile = &realBSONFile{
+			path:   dump.outputPath("oplog.bson", ""),
+			intent: oplogIntent,
+		}
 	}
 	dump.manager.Put(oplogIntent)
 	return nil
@@ -266,9 +268,27 @@ func (dump *MongoDump) CreateUsersRolesVersionIntentsForDB(db string) error {
 		rolesIntent.BSONFile = &archive.MuxIn{Intent: rolesIntent, Mux: dump.archive.Mux}
 		versionIntent.BSONFile = &archive.MuxIn{Intent: versionIntent, Mux: dump.archive.Mux}
 	} else {
-		usersIntent.BSONFile = &realBSONFile{path: filepath.Join(outDir, nameGz(dump.OutputOptions.Gzip, "$admin.system.users.bson")), intent: usersIntent}
-		rolesIntent.BSONFile = &realBSONFile{path: filepath.Join(outDir, nameGz(dump.OutputOptions.Gzip, "$admin.system.roles.bson")), intent: rolesIntent}
-		versionIntent.BSONFile = &realBSONFile{path: filepath.Join(outDir, nameGz(dump.OutputOptions.Gzip, "$admin.system.version.bson")), intent: versionIntent}
+		usersIntent.BSONFile = &realBSONFile{
+			path: filepath.Join(
+				outDir,
+				nameGz(dump.OutputOptions.Gzip, "$admin.system.users.bson"),
+			),
+			intent: usersIntent,
+		}
+		rolesIntent.BSONFile = &realBSONFile{
+			path: filepath.Join(
+				outDir,
+				nameGz(dump.OutputOptions.Gzip, "$admin.system.roles.bson"),
+			),
+			intent: rolesIntent,
+		}
+		versionIntent.BSONFile = &realBSONFile{
+			path: filepath.Join(
+				outDir,
+				nameGz(dump.OutputOptions.Gzip, "$admin.system.version.bson"),
+			),
+			intent: versionIntent,
+		}
 	}
 	dump.manager.Put(usersIntent)
 	dump.manager.Put(rolesIntent)
@@ -337,11 +357,18 @@ func (dump *MongoDump) NewIntentFromOptions(
 		} else if ci.IsTimeseries() && !dump.serverVersionArray.SupportsRawData() {
 			// 8.3+ supports viewless timeseries, so they end up in the final else block as a normal
 			// collection.
-			path := nameGz(dump.OutputOptions.Gzip, dump.outputPath(dbName, common.TimeseriesBucketPrefix+ci.Name)+".bson")
+			path := nameGz(
+				dump.OutputOptions.Gzip,
+				dump.outputPath(dbName, common.TimeseriesBucketPrefix+ci.Name)+".bson",
+			)
 			intent.BSONFile = &realBSONFile{path: path, intent: intent}
 			intent.Location = path
 		} else if ci.IsView() && !dump.OutputOptions.ViewsAsCollections {
-			log.Logvf(log.DebugLow, "not dumping data for %#q because it is a view", dbName+"."+ci.Name)
+			log.Logvf(
+				log.DebugLow,
+				"not dumping data for %#q because it is a view",
+				dbName+"."+ci.Name,
+			)
 		} else {
 			// otherwise, if it's either not a view or we're treating views as collections
 			// then create a standard filesystem path for this collection.
@@ -361,7 +388,10 @@ func (dump *MongoDump) NewIntentFromOptions(
 				Buffer: &bytes.Buffer{},
 			}
 		} else {
-			path := nameGz(dump.OutputOptions.Gzip, dump.outputPath(dbName, ci.Name)+".metadata.json")
+			path := nameGz(
+				dump.OutputOptions.Gzip,
+				dump.outputPath(dbName, ci.Name)+".metadata.json",
+			)
 			intent.MetadataFile = &realMetadataFile{path: path, intent: intent}
 		}
 	}

@@ -7,12 +7,14 @@
 package mongorestore
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/mongodb/mongo-tools/common/archive"
+	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
 	"github.com/mongodb/mongo-tools/common/testtype"
@@ -45,7 +47,7 @@ var (
 
 func TestMongorestoreShortArchive(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
-	_, err := testutil.GetBareSession()
+	_, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -100,7 +102,11 @@ func TestMongorestoreShortArchive(t *testing.T) {
 
 func TestMongorestoreArchiveWithOplog(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
-	_, err := testutil.GetBareSession()
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it replays an oplog, and DSC does not support the applyOps command",
+	)
+	_, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -124,7 +130,7 @@ func TestMongorestoreArchiveWithOplog(t *testing.T) {
 
 func TestMongorestoreBadFormatArchive(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
-	_, err := testutil.GetBareSession()
+	_, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -152,7 +158,7 @@ func TestMongorestoreBadFormatArchive(t *testing.T) {
 
 // ----------------------------------------------------------------------
 // All tests from this point onwards use testify, not convey. See the
-// CONTRIBUING.md file in the top level of the repo for details on how to
+// CONTRIBUTING.md file in the top level of the repo for details on how to
 // write tests using testify.
 // ----------------------------------------------------------------------
 
@@ -162,20 +168,55 @@ func TestReadDumpServerVersionFromArchive(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
 	withArchiveMongodump(t, func(archivePath string) {
-		sessionProvider, _, err := testutil.GetBareSessionProvider()
+		sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 		require.NoError(err)
 		args := []string{
 			NumParallelCollectionsOption, "1",
 			NumInsertionWorkersOption, "1",
 			ArchiveOption + "=" + archivePath,
+			// `ParseOptions` calls `log.SetVerbosity` with the options it parsed, which resets the
+			// global verbosity this package's `init()` raised, so the debug lines below are only
+			// emitted if the restore asks for them.
+			"-vvv",
 		}
 		restore, err := getRestoreWithArgs(args...)
 		require.NoError(err)
 		defer restore.Close()
 
+		// The three versions read out of the archive prelude are only reported through the log, so
+		// the log is the only place they can be checked.
+		var logged bytes.Buffer
+		log.SetWriter(&logged)
+		defer log.SetWriter(os.Stderr)
+
 		_ = restore.Restore()
-		expectedVersion, _ := sessionProvider.ServerVersionArray()
-		require.Equal(restore.dumpServerVersion, expectedVersion)
+
+		for _, want := range []string{
+			"archive format version",
+			"archive server version",
+			"archive tool version",
+		} {
+			require.Regexp(
+				want+" `\\S+`",
+				logged.String(),
+				"the restore log reports the %s from the archive prelude",
+				want,
+			)
+		}
+
+		// The prelude records the server's version *string*, so compare against
+		// that same source. buildInfo.versionArray reports the next, unreleased
+		// version for source builds (8.0.16-353-gb19191c has a versionArray of
+		// [8, 0, 17, -100]), which would not match.
+		serverVersionStr, err := sessionProvider.ServerVersion()
+		require.NoError(err)
+		expectedVersion, err := db.StrToVersion(serverVersionStr)
+		require.NoError(err)
+		require.Equal(
+			expectedVersion,
+			restore.dumpServerVersion,
+			"dumpServerVersion matches the version reported by the server",
+		)
 	})
 }
 
@@ -184,7 +225,7 @@ func TestMongorestoreArchiveAdminNamespaces(t *testing.T) {
 
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	require.NoError(err, "can connect to server")
 
 	fcv := testutil.GetFCV(session)
@@ -205,7 +246,7 @@ func TestMongorestoreArchiveAdminNamespaces(t *testing.T) {
 func testRestoreAdminNamespaces(t *testing.T) {
 	require := require.New(t)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	require.NoError(err, "can connect to server")
 
 	dbName := uniqueDBName()
@@ -260,7 +301,7 @@ func testRestoreAdminNamespaces(t *testing.T) {
 func testRestoreAdminNamespacesAsAtlasProxy(t *testing.T) {
 	require := require.New(t)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	require.NoError(err, "can connect to server")
 
 	dbName := uniqueDBName()
@@ -410,8 +451,8 @@ func runArchiveMongodump(t *testing.T, file string, dumpArgs ...string) string {
 }
 
 // GetArchiveMongoDump returns a MongoDump that’s ready to call Dump().
-func GetArchiveMongoDump(output io.WriteCloser) (*mongodump.MongoDump, error) {
-	provider, toolOpts, err := testutil.GetBareSessionProvider()
+func GetArchiveMongoDump(t *testing.T, output io.WriteCloser) (*mongodump.MongoDump, error) {
+	provider, toolOpts, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		return nil, errors.Wrap(err, "get session provider for dump")
 	}
@@ -435,8 +476,8 @@ func GetArchiveMongoDump(output io.WriteCloser) (*mongodump.MongoDump, error) {
 	return dump, nil
 }
 
-func GetArchiveMongoRestore(input io.ReadCloser) (*MongoRestore, error) {
-	_, toolOpts, err := testutil.GetBareSessionProvider()
+func GetArchiveMongoRestore(t *testing.T, input io.ReadCloser) (*MongoRestore, error) {
+	_, toolOpts, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		return nil, errors.Wrap(err, "get session provider for dump")
 	}

@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,11 @@ const (
 	deprecatedDBAndCollectionsOptionsWarning = "The --db and --collection flags are deprecated for " +
 		"this use-case; please use --nsInclude instead, " +
 		"i.e. with --nsInclude=${DATABASE}.${COLLECTION}"
+
+	// maxParallelCollectionsPerProc bounds how many parallel collections an archive's
+	// header can request per GOMAXPROCS, so a crafted or corrupt archive can't force
+	// mongorestore to spin up an unreasonable number of goroutines.
+	maxParallelCollectionsPerProc = 4
 )
 
 var (
@@ -82,9 +88,6 @@ type MongoRestore struct {
 	includer *ns.Matcher
 	excluder *ns.Matcher
 
-	// indexes belonging to dbs and collections
-	dbCollectionIndexes map[string]collectionIndexes
-
 	indexCatalog *idx.IndexCatalog
 
 	archive *archive.Reader
@@ -100,8 +103,6 @@ type MongoRestore struct {
 	dumpServerVersion db.Version
 	serverVersion     db.Version
 }
-
-type collectionIndexes map[string][]*idx.IndexDocument
 
 // New initializes an instance of MongoRestore according to the provided options.
 func New(opts Options) (*MongoRestore, error) {
@@ -316,6 +317,10 @@ func (restore *MongoRestore) ParseAndValidateOptions() error {
 		return fmt.Errorf("cannot specify --preserveUUID without --drop")
 	}
 
+	if err := restore.checkApplyOpsGuardrail(); err != nil {
+		return err
+	}
+
 	// a single dash signals reading from stdin
 	if restore.TargetDirectory == "-" {
 		if restore.InputOptions.Archive != "" {
@@ -328,6 +333,27 @@ func (restore *MongoRestore) ParseAndValidateOptions() error {
 	}
 	if restore.InputReader == nil {
 		restore.InputReader = os.Stdin
+	}
+
+	return nil
+}
+
+// checkApplyOpsGuardrail fails the restore when --oplogReplay or --preserveUUID is used against
+// either a sharded cluster. mongorestore implements both of these features on top of the `applyOps`
+// command, which sharded clusters do not support.
+func (restore *MongoRestore) checkApplyOpsGuardrail() error {
+	isSharded, err := restore.SessionProvider.IsMongos()
+	if err != nil {
+		return fmt.Errorf("error determining if the cluster is sharded: %w", err)
+	}
+
+	if isSharded {
+		if restore.InputOptions.OplogReplay {
+			return errors.New("cannot use --oplogReplay when restoring to a sharded cluster")
+		}
+		if restore.OutputOptions.PreserveUUID {
+			return errors.New("cannot use --preserveUUID when restoring to a sharded cluster")
+		}
 	}
 
 	return nil
@@ -408,12 +434,21 @@ func (restore *MongoRestore) Restore() Result {
 			if usedDefaultTarget {
 				log.Logv(log.Always, util.ShortUsage("mongorestore"))
 			}
-			return Result{Err: fmt.Errorf("mongorestore target '%v' invalid: %v", restore.TargetDirectory, err)}
+			return Result{
+				Err: fmt.Errorf(
+					"mongorestore target '%v' invalid: %v",
+					restore.TargetDirectory,
+					err,
+				),
+			}
 		}
 		preludeFileExists, err := restore.ReadPreludeMetadata(target)
 		if !preludeFileExists {
 			// don't error out here because mongodump versions before 100.12.0 will not include prelude.json
-			log.Logvf(log.DebugLow, "no prelude metadata found in target directory or parent, skipping")
+			log.Logvf(
+				log.DebugLow,
+				"no prelude metadata found in target directory or parent, skipping",
+			)
 		} else if err != nil {
 			return Result{Err: fmt.Errorf("error reading dump metadata: %w", err)}
 		}
@@ -441,25 +476,26 @@ func (restore *MongoRestore) Restore() Result {
 		restore.OutputOptions.NumInsertionWorkers = restore.OutputOptions.NumParallelCollections
 	}
 	if restore.InputOptions.Archive != "" {
-		if int(
-			restore.archive.Prelude.Header.ConcurrentCollections,
-		) > restore.OutputOptions.NumParallelCollections {
-			restore.OutputOptions.NumParallelCollections = int(
-				restore.archive.Prelude.Header.ConcurrentCollections,
-			)
-			log.Logvf(
-				log.Always,
-				"setting number of parallel collections to number of parallel collections in archive (%v)",
-				restore.archive.Prelude.Header.ConcurrentCollections,
-			)
-		}
+		restore.OutputOptions.NumParallelCollections = numParallelCollectionsForArchive(
+			int(restore.archive.Prelude.Header.ConcurrentCollections),
+			restore.OutputOptions.NumParallelCollections,
+		)
 	}
 
 	// Create the demux before intent creation, because muted archive intents need
 	// to register themselves with the demux directly
 	if restore.InputOptions.Archive != "" {
+		// The demux must listen on the namespace that the archive data was written
+		// under, which is determined by the server version that produced the archive
+		// (the same version PreludeExplorer uses to derive the receiver namespace),
+		// not the destination server version. Archives too old to record a parseable
+		// version predate viewless timeseries, so they always used system.buckets.
+		sourceVersion, verErr := db.StrToVersion(restore.archive.Prelude.Header.ServerVersion)
+		if verErr != nil {
+			sourceVersion = db.Version{}
+		}
 		restore.archive.Demux = archive.CreateDemux(
-			restore.serverVersion,
+			sourceVersion,
 			restore.archive.Prelude.NamespaceMetadatas,
 			restore.archive.In,
 			restore.isAtlasProxy,
@@ -578,8 +614,7 @@ func (restore *MongoRestore) Restore() Result {
 			if intent == nil {
 				return Result{Err: fmt.Errorf("no intent for collection in archive: %#q", ns)}
 			}
-			if intent.IsSystemIndexes() ||
-				intent.IsUsers() ||
+			if intent.IsUsers() ||
 				intent.IsRoles() ||
 				intent.IsAuthVersion() {
 				log.Logvf(log.DebugLow, "special collection %#q found", ns)
@@ -615,11 +650,6 @@ func (restore *MongoRestore) Restore() Result {
 		}
 	}
 
-	err = restore.LoadIndexesFromBSON()
-	if err != nil {
-		return Result{Err: fmt.Errorf("restore error: %v", err)}
-	}
-
 	err = restore.PopulateMetadataForIntents()
 	if err != nil {
 		return Result{Err: fmt.Errorf("restore error: %v", err)}
@@ -634,16 +664,9 @@ func (restore *MongoRestore) Restore() Result {
 	if restore.InputOptions.Archive != "" {
 		restore.manager.UsePrioritizer(restore.archive.Demux.NewPrioritizer(restore.manager))
 	} else if restore.OutputOptions.NumParallelCollections > 1 {
-		// 3.0+ has collection-level locking for writes, so it is most efficient to
-		// prioritize by collection size. Pre-3.0 we try to avoid inserting into collections
-		// in the same database simultaneously due to the database-level locking.
-		// Up to 4.2, foreground index builds take a database-level lock for the entire build,
-		// but this prioritizer is not used for index builds so we don't need to worry about that here.
-		if restore.serverVersion.GTE(db.Version{3, 0, 0}) {
-			restore.manager.Finalize(intents.LongestTaskFirst)
-		} else {
-			restore.manager.Finalize(intents.MultiDatabaseLTF)
-		}
+		// Writes take a collection-level lock, so it is most efficient to prioritize by
+		// collection size.
+		restore.manager.Finalize(intents.LongestTaskFirst)
 	} else {
 		// use legacy restoration order if we are single-threaded
 		restore.manager.Finalize(intents.Legacy)
@@ -683,6 +706,37 @@ func (restore *MongoRestore) Restore() Result {
 	}
 
 	return result
+}
+
+// numParallelCollectionsForArchive returns the number of parallel collections to use
+// when restoring from an archive, raising currentNumParallelCollections to match the
+// concurrency the archive was written with. The archive's requested value is capped so
+// that a crafted or corrupt archive can't force mongorestore to spin up an unreasonable
+// number of goroutines.
+func numParallelCollectionsForArchive(
+	archiveConcurrentCollections, currentNumParallelCollections int,
+) int {
+	maxParallelCollections := runtime.GOMAXPROCS(0) * maxParallelCollectionsPerProc
+	if archiveConcurrentCollections > maxParallelCollections {
+		log.Logvf(
+			log.Always,
+			"archive requested %v parallel collections, which exceeds the maximum of %v for "+
+				"this machine; using the maximum instead",
+			archiveConcurrentCollections,
+			maxParallelCollections,
+		)
+		archiveConcurrentCollections = maxParallelCollections
+	}
+	if archiveConcurrentCollections > currentNumParallelCollections {
+		log.Logvf(
+			log.Always,
+			"setting number of parallel collections to %v, the number of concurrent collections "+
+				"used to write the archive (possibly capped for this machine)",
+			archiveConcurrentCollections,
+		)
+		return archiveConcurrentCollections
+	}
+	return currentNumParallelCollections
 }
 
 // ReadPreludeMetadata finds and parses the prelude.json file if it's present.

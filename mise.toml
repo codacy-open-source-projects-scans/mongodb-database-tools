@@ -6,20 +6,39 @@
 
 [tools]
 # Go and Go tools
-go = "1.25.9"
-"go:golang.org/x/tools/cmd/goimports" = "0.29.0"
-"github:golangci/golangci-lint" = "2.6.2"
-"github:securego/gosec" = "2.22.10"
-"github:segmentio/golines" = "0.12.2"
+go = "1.26.8"
+"go:golang.org/x/tools/gopls" = "0.23.0"
+"github:golangci/golangci-lint" = "2.12.2"
+"github:securego/gosec" = "2.27.1"
+"github:houseabsolute/omegasort" = "0.2.1"
 "github:houseabsolute/precious" = "0.10.2"
+"github:crate-ci/typos" = "1.46.1"
+"github:koalaman/shellcheck" = "0.11.0"
+"github:mvdan/sh" = { version = "3.13.1", bin = "shfmt" }
 
 # Node and npm tools
+# node is here because the npm: tools below need a Node runtime to execute.
 node = "22.22.0"
 "npm:eslint" = "8.57.0"
-"npm:prettier" = "3.4.2"
 "npm:github-codeowners" = "0.2.1"
+# This opts out of the minimum_release_age below because this release is ours and is cut as it is
+# needed.
+"npm:@mongodb-js/mongodb-runner" = { version = "8.0.2", minimum_release_age = "0d" }
+"npm:oxfmt" = "0.52.0"
+
+[settings]
+# This prevents us from upgrading to anything that was released less than 7 days ago. It gives us a
+# bit of protection against supply-chain attacks.
+minimum_release_age = "7d"
 
 [settings.node]
 # We turn off GPG verification for node because it has been flaky in CI, and also requires a local
 # GPG public key.
 gpg_verify = false
+
+[hooks]
+# Pin the mongodb driver bundled with mongodb-runner to 7.5.0 so it can manage MongoDB 4.2 (see
+# scripts/pin-mongodb-runner.sh). This is a project-level hook rather than the runner's tool-level
+# postinstall because that option only accepts a string in this mise version, and because a
+# project-level hook also re-pins an already-installed runner.
+postinstall = "scripts/pin-mongodb-runner.sh"

@@ -7,10 +7,14 @@
 package db
 
 import (
+	"context"
+	"net"
 	"os"
 	"testing"
 
+	"github.com/mongodb/mongo-tools/common/db/dsctest"
 	"github.com/mongodb/mongo-tools/common/options"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,73 +22,16 @@ import (
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
 )
 
-// var block and functions copied from testutil to avoid import cycle.
 var (
-	UserAdmin              = "uAdmin"
-	UserAdminPassword      = "password"
-	CreatedUserNameEnv     = "TOOLS_TESTING_AUTH_USERNAME"
-	CreatedUserPasswordEnv = "TOOLS_TESTING_AUTH_PASSWORD"
-	PKCS8Password          = "TOOLS_TESTING_PKCS8_PASSWORD"
-	kerberosUsername       = "drivers%40LDAPTEST.10GEN.CC"
-	kerberosConnection     = "ldaptest.10gen.cc:27017"
+	PKCS8Password      = "TOOLS_TESTING_PKCS8_PASSWORD"
+	kerberosUsername   = "drivers%40LDAPTEST.10GEN.CC"
+	kerberosConnection = "ldaptest.10gen.cc:27017"
 )
-
-func DBGetAuthOptions() options.Auth {
-	if testtype.HasTestType(testtype.AuthTestType) {
-		return options.Auth{
-			Username: os.Getenv(CreatedUserNameEnv),
-			Password: os.Getenv(CreatedUserPasswordEnv),
-			Source:   "admin",
-		}
-	}
-
-	return options.Auth{}
-}
-
-func DBGetSSLOptions() options.SSL {
-	if testtype.HasTestType(testtype.SSLTestType) {
-		return options.SSL{
-			UseSSL:        true,
-			SSLCAFile:     "../db/testdata/ca-ia.pem",
-			SSLPEMKeyFile: "../db/testdata/test-client.pem",
-		}
-	}
-
-	return options.SSL{
-		UseSSL: false,
-	}
-}
-
-func DBGetConnString() *options.URI {
-	if testtype.HasTestType(testtype.SSLTestType) {
-		return &options.URI{
-			//ConnectionString: "mongodb://localhost" + DefaultTestPort + "/",
-			ConnString: &connstring.ConnString{
-				SSLCaFileSet:                   true,
-				SSLCaFile:                      "../db/testdata/ca-ia.pem",
-				SSLClientCertificateKeyFileSet: true,
-				SSLClientCertificateKeyFile:    "../db/testdata/test-client.pem",
-			},
-		}
-	}
-
-	return &options.URI{}
-}
 
 func TestNewSessionProvider(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	auth := DBGetAuthOptions()
-	ssl := DBGetSSLOptions()
-
-	opts := options.ToolOptions{
-		Connection: &options.Connection{
-			Port: DefaultTestPort,
-		},
-		URI:  DBGetConnString(),
-		SSL:  &ssl,
-		Auth: &auth,
-	}
+	opts := testopts.MustGetToolOptions(t)
 	provider, err := NewSessionProvider(opts)
 	require.NoError(t, err)
 
@@ -95,6 +42,25 @@ func TestNewSessionProvider(t *testing.T) {
 	)
 
 	provider.Close()
+}
+
+func TestIsDisaggregatedStorage(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	opts := testopts.MustGetToolOptions(t)
+	provider, err := NewSessionProvider(opts)
+	require.NoError(t, err, "creating a session provider")
+	defer provider.Close()
+
+	// Against a DSC cluster the detector legitimately reports true, which is not what this test
+	// asserts, so skip there.
+	client, err := provider.GetSession()
+	require.NoError(t, err, "getting a session")
+	dsctest.SkipForDisaggregatedStorage(t, client, "the test asserts the non-DSC result")
+
+	isDSC, err := provider.IsDisaggregatedStorage()
+	require.NoError(t, err, "checking for disaggregated storage")
+	assert.False(t, isDSC, "a normal server reports no disaggregated storage")
 }
 
 func TestConfigureClientForSRV(t *testing.T) {
@@ -115,24 +81,14 @@ func TestConfigureClientForSRV(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	_, err = configureClient(*toolOptions)
+	err = configureClientAndDisconnectAtEnd(t, *toolOptions)
 	require.NoError(t, err)
 }
 
 func TestDatabaseNames(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	auth := DBGetAuthOptions()
-	ssl := DBGetSSLOptions()
-
-	opts := options.ToolOptions{
-		Connection: &options.Connection{
-			Port: DefaultTestPort,
-		},
-		URI:  DBGetConnString(),
-		SSL:  &ssl,
-		Auth: &auth,
-	}
+	opts := testopts.MustGetToolOptions(t)
 	provider, err := NewSessionProvider(opts)
 	require.NoError(t, err)
 
@@ -159,17 +115,7 @@ func TestDatabaseNames(t *testing.T) {
 func TestFindOne(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	auth := DBGetAuthOptions()
-	ssl := DBGetSSLOptions()
-
-	opts := options.ToolOptions{
-		Connection: &options.Connection{
-			Port: DefaultTestPort,
-		},
-		URI:  DBGetConnString(),
-		SSL:  &ssl,
-		Auth: &auth,
-	}
+	opts := testopts.MustGetToolOptions(t)
 	provider, err := NewSessionProvider(opts)
 	require.NoError(t, err)
 
@@ -191,16 +137,7 @@ func TestFindOne(t *testing.T) {
 func TestGetIndexes(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	auth := DBGetAuthOptions()
-	ssl := DBGetSSLOptions()
-	opts := options.ToolOptions{
-		Connection: &options.Connection{
-			Port: DefaultTestPort,
-		},
-		URI:  DBGetConnString(),
-		SSL:  &ssl,
-		Auth: &auth,
-	}
+	opts := testopts.MustGetToolOptions(t)
 	provider, err := NewSessionProvider(opts)
 	require.NoError(t, err)
 	session, err := provider.GetSession()
@@ -246,18 +183,7 @@ func TestGetIndexes(t *testing.T) {
 func TestServerVersionArray(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	auth := DBGetAuthOptions()
-	ssl := DBGetSSLOptions()
-
-	opts := options.ToolOptions{
-		Connection: &options.Connection{
-			Port: DefaultTestPort,
-			Host: "localhost",
-		},
-		URI:  DBGetConnString(),
-		SSL:  &ssl,
-		Auth: &auth,
-	}
+	opts := testopts.MustGetToolOptions(t)
 	provider, err := NewSessionProvider(opts)
 	require.NoError(t, err)
 
@@ -266,27 +192,49 @@ func TestServerVersionArray(t *testing.T) {
 	assert.True(t, version.GT(Version{}))
 }
 
+// The certificate tests below build ToolOptions by hand instead of going through `GetToolOptions`,
+// so they have to resolve the runner-allocated address from `TOOLS_TESTING_MONGOD` themselves.
+func hostAndPortFromEnvVar(t *testing.T) (string, string) {
+	t.Helper()
+
+	uri := os.Getenv(testopts.URIEnvVar)
+	if uri == "" {
+		return "localhost", testopts.DefaultTestPort
+	}
+
+	cs, err := connstring.ParseAndValidate(uri)
+	require.NoError(t, err, "TOOLS_TESTING_MONGOD is a valid connection string")
+	require.NotEmpty(t, cs.Hosts, "TOOLS_TESTING_MONGOD names at least one host")
+
+	host, port, err := net.SplitHostPort(cs.Hosts[0])
+	require.NoError(t, err, "TOOLS_TESTING_MONGOD host names a port")
+
+	return host, port
+}
+
 func TestServerCertificateVerification(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	testtype.SkipUnlessTestType(t, testtype.SSLTestType)
 
-	auth := DBGetAuthOptions()
-	sslOrigin := DBGetSSLOptions()
+	auth := testopts.GetAuthOptions()
+	sslOrigin := testopts.SSLOptionsWithCert("test-client.pem")
 
 	// intermediate certs only
 	ssl := sslOrigin
-	ssl.SSLCAFile = "../db/testdata/ia.pem"
+	ssl.SSLCAFile = testopts.TestDataPath("ia.pem")
+	host, port := hostAndPortFromEnvVar(t)
 	opts := options.ToolOptions{
 		Connection: &options.Connection{
-			Port:    DefaultTestPort,
+			Host:    host,
+			Port:    port,
 			Timeout: 10,
 		},
-		URI:  DBGetConnString(),
+		URI:  testopts.URIWithCert("test-client.pem"),
 		SSL:  &ssl,
 		Auth: &auth,
 	}
 
-	opts.ConnString.SSLCaFile = "../db/testdata/ia.pem"
+	opts.ConnString.SSLCaFile = testopts.TestDataPath("ia.pem")
 	provider, err := NewSessionProvider(opts)
 	require.NoError(t, err)
 	require.NoError(t, provider.client.Ping(t.Context(), nil))
@@ -298,24 +246,26 @@ func TestServerPKCS8Verification(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	testtype.SkipUnlessTestType(t, testtype.SSLTestType)
 
-	auth := DBGetAuthOptions()
+	auth := testopts.GetAuthOptions()
 	ssl := options.SSL{
 		UseSSL:    true,
-		SSLCAFile: "../db/testdata/ca-ia.pem",
+		SSLCAFile: testopts.TestDataPath("ca-ia.pem"),
 	}
 
 	t.Run("with unencrypted password", func(t *testing.T) {
-		ssl.SSLPEMKeyFile = "../db/testdata/test-client-pkcs8-unencrypted.pem"
+		ssl.SSLPEMKeyFile = testopts.TestDataPath("test-client-pkcs8-unencrypted.pem")
+		host, port := hostAndPortFromEnvVar(t)
 		opts := options.ToolOptions{
 			Connection: &options.Connection{
-				Port:    DefaultTestPort,
+				Host:    host,
+				Port:    port,
 				Timeout: 10,
 			},
-			URI:  DBGetConnString(),
+			URI:  testopts.URIWithCert("test-client.pem"),
 			SSL:  &ssl,
 			Auth: &auth,
 		}
-		opts.ConnString.SSLCaFile = "../db/testdata/ca-ia.pem"
+		opts.ConnString.SSLCaFile = testopts.TestDataPath("ca-ia.pem")
 		provider, err := NewSessionProvider(opts)
 		require.NoError(t, err)
 		require.NoError(t, provider.client.Ping(t.Context(), nil))
@@ -323,18 +273,20 @@ func TestServerPKCS8Verification(t *testing.T) {
 	})
 
 	t.Run("with encrypted password", func(t *testing.T) {
-		ssl.SSLPEMKeyFile = "../db/testdata/test-client-pkcs8-encrypted.pem"
+		ssl.SSLPEMKeyFile = testopts.TestDataPath("test-client-pkcs8-encrypted.pem")
 		ssl.SSLPEMKeyPassword = os.Getenv(PKCS8Password)
+		host, port := hostAndPortFromEnvVar(t)
 		opts := options.ToolOptions{
 			Connection: &options.Connection{
-				Port:    DefaultTestPort,
+				Host:    host,
+				Port:    port,
 				Timeout: 10,
 			},
-			URI:  DBGetConnString(),
+			URI:  testopts.URIWithCert("test-client.pem"),
 			SSL:  &ssl,
 			Auth: &auth,
 		}
-		opts.ConnString.SSLCaFile = "../db/testdata/ca-ia.pem"
+		opts.ConnString.SSLCaFile = testopts.TestDataPath("ca-ia.pem")
 		provider, err := NewSessionProvider(opts)
 		require.NoError(t, err)
 		require.NoError(t, provider.client.Ping(t.Context(), nil))
@@ -387,7 +339,7 @@ func TestConfigureClientMultipleHosts(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	_, err = configureClient(*toolOptions)
+	err = configureClientAndDisconnectAtEnd(t, *toolOptions)
 	require.NoError(t, err)
 }
 
@@ -416,7 +368,7 @@ func TestConfigureClientAKS(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	_, err = configureClient(*toolOptions)
+	err = configureClientAndDisconnectAtEnd(t, *toolOptions)
 	require.NoError(t, err)
 	assert.Equal(t, "MONGODB-OIDC", toolOptions.Mechanism)
 }
@@ -431,7 +383,9 @@ func TestMisconfigureClientAKS(t *testing.T) {
 		URI:        true,
 	}
 
-	// We don't set AZURE_FEDERATED_TOKEN_FILE here
+	// configureClient uses os.LookupEnv, so an ambient AZURE_FEDERATED_TOKEN_FILE
+	// would make this configuration succeed. t.Setenv can't express "unset".
+	unsetEnvForTest(t, "AZURE_FEDERATED_TOKEN_FILE")
 	t.Setenv("AZURE_APP_CLIENT_ID", "test")
 	t.Setenv("AZURE_IDENTITY_CLIENT_ID", "test")
 	t.Setenv("AZURE_TENANT_ID", "test")
@@ -444,6 +398,31 @@ func TestMisconfigureClientAKS(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	_, err = configureClient(*toolOptions)
+	err = configureClientAndDisconnectAtEnd(t, *toolOptions)
 	require.Error(t, err)
+}
+
+// configureClient starts background topology monitoring, so a client that is
+// never disconnected leaves goroutines resolving hostnames for the rest of the
+// package's test run.
+func configureClientAndDisconnectAtEnd(t *testing.T, opts options.ToolOptions) error {
+	client, err := configureClient(opts)
+	if client != nil {
+		t.Cleanup(func() {
+			require.NoError(t, client.Disconnect(context.Background()), "disconnect client")
+		})
+	}
+
+	return err
+}
+
+func unsetEnvForTest(t *testing.T, name string) {
+	orig, wasSet := os.LookupEnv(name)
+	require.NoError(t, os.Unsetenv(name), "unset %s", name)
+
+	if wasSet {
+		t.Cleanup(func() {
+			require.NoError(t, os.Setenv(name, orig), "restore %s", name)
+		})
+	}
 }

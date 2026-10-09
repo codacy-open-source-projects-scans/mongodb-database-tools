@@ -62,47 +62,6 @@ func (restore *MongoRestore) MetadataFromJSON(jsonBytes []byte) (*Metadata, erro
 	return meta, nil
 }
 
-// LoadIndexesFromBSON reads indexes from the index BSON files and
-// caches them in the MongoRestore object.
-func (restore *MongoRestore) LoadIndexesFromBSON() error {
-
-	dbCollectionIndexes := make(map[string]collectionIndexes)
-
-	for _, dbname := range restore.manager.SystemIndexDBs() {
-		dbCollectionIndexes[dbname] = make(collectionIndexes)
-		intent := restore.manager.SystemIndexes(dbname)
-		err := intent.BSONFile.Open()
-		if err != nil {
-			return err
-		}
-		defer intent.BSONFile.Close()
-		bsonSource := db.NewDecodedBSONSource(db.NewBSONSource(intent.BSONFile))
-		defer bsonSource.Close()
-
-		// iterate over stored indexes, saving all that match the collection
-		for {
-			indexDocument := &idx.IndexDocument{}
-			if !bsonSource.Next(&indexDocument) {
-				break
-			}
-			//nolint:errcheck
-			namespace := indexDocument.Options["ns"].(string)
-			dbCollectionIndexes[dbname][stripDBFromNS(namespace)] =
-				append(dbCollectionIndexes[dbname][stripDBFromNS(namespace)], indexDocument)
-		}
-		if err := bsonSource.Err(); err != nil {
-			return fmt.Errorf("error scanning system.indexes: %v", err)
-		}
-	}
-	restore.dbCollectionIndexes = dbCollectionIndexes
-	return nil
-}
-
-func stripDBFromNS(ns string) string {
-	_, c := util.SplitNamespace(ns)
-	return c
-}
-
 // CollectionExists returns true if the given intent's collection exists.
 func (restore *MongoRestore) CollectionExists(dbName, coll string) (bool, error) {
 	restore.knownCollectionsMutex.Lock()
@@ -164,16 +123,6 @@ func (restore *MongoRestore) CreateIndexes(
 		// update the namespace of the index before inserting
 		index.Options["ns"] = dbName + "." + collectionName
 
-		// check for length violations before building the command
-		if restore.serverVersion.LT(db.Version{4, 2, 0}) {
-			fullIndexName := fmt.Sprintf("%v.$%v", index.Options["ns"], index.Options["name"])
-			if len(fullIndexName) > 127 {
-				return fmt.Errorf(
-					"cannot restore index with namespace %#q: "+
-						"namespace is too long (max size is 127 bytes)", fullIndexName)
-			}
-		}
-
 		nameStr, isString := index.Options["name"].(string)
 		if !isString {
 			return fmt.Errorf(
@@ -201,6 +150,7 @@ func (restore *MongoRestore) CreateIndexes(
 	rawCommand := bson.D{
 		{"createIndexes", collectionName},
 		{"indexes", indexes},
+		{"ignoreUnknownIndexOptions", true},
 	}
 
 	log.Logvf(
@@ -209,48 +159,12 @@ func (restore *MongoRestore) CreateIndexes(
 		strings.Join(indexNames, ", "),
 	)
 
-	if restore.serverVersion.GTE(db.Version{4, 1, 9}) {
-		rawCommand = append(rawCommand, bson.E{"ignoreUnknownIndexOptions", true})
-	}
-
 	ctx, cancel := restore.writeContext()
 	defer cancel()
 
 	err = session.Database(dbName).RunCommand(ctx, rawCommand).Err()
-	if err == nil {
-		return nil
-	}
-	if err.Error() != "no such cmd: createIndexes" {
+	if err != nil {
 		return fmt.Errorf("createIndex error: %v", err)
-	}
-
-	// if we're here, the connected server does not support the command, so we fall back
-	log.Logv(log.Info, "\tcreateIndexes command not supported, attemping legacy index insertion")
-	for _, idx := range indexes {
-		log.Logvf(log.Info, "\tmanually creating index %#q", idx.Options["name"])
-		err = restore.LegacyInsertIndex(dbName, idx)
-		if err != nil {
-			return fmt.Errorf("error creating index %#q: %v", idx.Options["name"], err)
-		}
-	}
-	return nil
-}
-
-// LegacyInsertIndex takes in an intent and an index document and attempts to
-// create the index on the "system.indexes" collection.
-func (restore *MongoRestore) LegacyInsertIndex(dbName string, index *idx.IndexDocument) error {
-	session, err := restore.SessionProvider.GetSession()
-	if err != nil {
-		return fmt.Errorf("error establishing connection: %v", err)
-	}
-
-	ctx, cancel := restore.writeContext()
-	defer cancel()
-
-	indexCollection := session.Database(dbName).Collection("system.indexes")
-	_, err = indexCollection.InsertOne(ctx, index)
-	if err != nil {
-		return fmt.Errorf("insert error: %v", err)
 	}
 
 	return nil
@@ -278,26 +192,24 @@ func (restore *MongoRestore) CreateCollection(
 
 }
 
-// UpdateAutoIndexId updates {autoIndexId: false} to {autoIndexId: true} if the server version is
-// >= 4.0 and the database is not `local`.
+// UpdateAutoIndexId removes {autoIndexId: ...} on servers that reject it, and otherwise
+// updates {autoIndexId: false} to {autoIndexId: true} if the database is not `local`.
 func (restore *MongoRestore) UpdateAutoIndexId(options bson.D) bson.D {
-	if restore.serverVersion.GTE(db.Version{4, 0, 0}) {
-		for i, elem := range options {
-			if elem.Key == "autoIndexId" {
-				if restore.serverVersion.GTE(db.Version{8, 2, 0}) {
-					options = append(options[:i], options[i+1:]...)
-					log.Logvf(
-						log.Always,
-						"autoIndexId is not allowed in server versions >= 8.2.0. Removing.",
-					)
-				} else if elem.Value == false &&
-					restore.ToolOptions.DB != "local" {
-					options[i].Value = true
-					log.Logvf(
-						log.Always,
-						"{autoIndexId: false} is not allowed in server versions >= 4.0. Changing to {autoIndexId: true}.",
-					)
-				}
+	for i, elem := range options {
+		if elem.Key == "autoIndexId" {
+			if restore.serverVersion.GTE(db.Version{8, 2, 0}) {
+				options = append(options[:i], options[i+1:]...)
+				log.Logvf(
+					log.Always,
+					"autoIndexId is not allowed in server versions >= 8.2.0. Removing.",
+				)
+			} else if elem.Value == false &&
+				restore.ToolOptions.DB != "local" {
+				options[i].Value = true
+				log.Logvf(
+					log.Always,
+					"{autoIndexId: false} is not allowed. Changing to {autoIndexId: true}.",
+				)
 			}
 		}
 	}
@@ -654,7 +566,10 @@ func (restore *MongoRestore) GetDumpAuthVersion() (int, error) {
 			case int64:
 				return int(authVersion), nil
 			default:
-				return 0, fmt.Errorf("can't unmarshal system.version curentVersion as an int: %v", versionDoc["currentVersion"])
+				return 0, fmt.Errorf(
+					"can't unmarshal system.version currentVersion as an int: %v",
+					versionDoc["currentVersion"],
+				)
 			}
 		}
 		log.Logvf(

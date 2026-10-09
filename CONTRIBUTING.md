@@ -12,6 +12,98 @@ If you're interested in contributing, we have a list of some suggested tickets t
 to get started on
 [here](https://jira.mongodb.org/issues/?jql=project%20%3D%20TOOLS%20AND%20labels%20%3D%20community%20and%20status%20%3D%20open)
 
+## Dev Tools (mise)
+
+We use [`mise`](https://mise.jdx.dev/) to manage dev tools (Go, linters, formatters, etc.), ensuring
+every developer and CI run uses the same versions.
+
+### Installing mise
+
+To install mise, run this command:
+
+```
+MISE_VERSION=$( cat ./scripts/mise-version.txt ) sh etc/mise.run.sh
+```
+
+Then run:
+
+```
+# Trust the config in this repo
+mise trust
+# Install all dev tools (Go, linters, etc.)
+mise install
+```
+
+After `mise install`, all tools (including `go`) are available directly in your shell when you're in
+this repo's directory. See [the mise docs](https://mise.jdx.dev/) for details on shell integration.
+
+### Adding a new tool
+
+Run `mise use github:some-org/some-tool@1.2.3`. We use the `github` backend for tools that provide
+binary releases. For Go tools without binary releases, use `go:some/package@vX.Y.Z`.
+
+## Using Mise
+
+You can integrate `mise` with your shell so that dev tools are automatically added to your `PATH`
+when your working directory is in the mongo-tools repo. See [the `mise` docs](https://mise.jdx.dev/)
+for more details on this.
+
+If you _don't_ want to use that integration, you can instead use
+`mise exec <list of tools> -- some-tool` to run the tools managed by `mise`, so something like
+`mise exec go -- go version`. It's important to list the tools that `mise exec` needs. Without that
+list, it will attempt to install _all_ the tools in our `mise.toml` when you run `mise exec`. This
+is generally fine locally, but can cause problems in CI, where many of the tools we use cannot be
+installed on some of the platforms we use.
+
+### In CI
+
+We do not set up the shell integration when installing `mise` in CI. That means that anything in CI
+which needs to run Go or another dev tool should use `mise exec go -- go ...` or a similar
+invocation.
+
+### Writing Code that Runs Dev Tools
+
+You may want to write code that uses these tools, either as a script for use in CI or some other
+case.
+
+All programmatic tool invocations should use `mise exec <tool>`. This will work in CI as well as
+locally.
+
+## Running DSC Clusters Locally
+
+In order to run these locally, you need access to the private `10gen/mongodb-downloader` repo. This
+is only available for MongoDB employees. The `dsc` config environment adds `mongodb-downloader` to
+the tools that `mise install` resolves, and mise needs a GitHub token that can read that repo.
+`github.credential_command` is ignored in project config for security reasons, so set it in your
+global mise config (`~/.config/mise/config.toml`):
+
+```toml
+[settings]
+github.credential_command = "gh auth token"
+```
+
+That command requires the [GitHub CLI](https://cli.github.com/) installed and authenticated.
+Alternatively, export `GITHUB_TOKEN` before running mise (this is what CI does).
+
+First, you must authenticate with aws using a profile that has access to the SLS image repo. You
+also need to authenticate with a profile that can access the S3 bucket containing Server binaries
+used by `mongodb-downloader`. This can be two different profiles or just one.
+
+In order to start a DSC cluster, run this command:
+
+```
+MISE_ENV=dsc SLS_AWS_ECR_PROFILE=... ./scripts/start-dsc-cluster.sh
+```
+
+The `SLS_AWS_ECR_PROFILE` value should be the name of the authenticated profile which has access to
+the ECR repo.
+
+You can stop the cluster with:
+
+```
+MISE_ENV=dsc mise exec -- ./scripts/stop-dsc-cluster.sh
+```
+
 ## Getting Started
 
 1. Create a [MongoDB JIRA account](https://jira.mongodb.org/secure/Signup!default.jspa).
@@ -23,6 +115,32 @@ to get started on
 5. For more details see http://www.mongodb.org/about/contributors/.
 6. Submit a [pull request](https://help.github.com/articles/creating-a-pull-request/) against the
    project for review.
+
+## Merge Queue
+
+All merges go through the GitHub merge queue. The queue re-runs CI on the result of merging your
+branch into `master`, which can catch breakage that isn't seen just by running CI on the PR.
+
+This repo's branch protection rules require exactly one status check, `evergreen/merge-queue`, which
+is the `merge-queue` build variant in `common.yml`. The only task in that variant is a no-op that
+`depends_on` the tasks that gate a merge. It turns green as soon as those pass, so a PR can enter
+the queue without waiting for every task the PR runs.
+
+To change what gates a merge, edit that variant's `depends_on`. Many test tasks include the
+`required-for-merge-queue` tag, so **a new test task must carry the tag** if we want it to block
+merges. A unit test in `evergreen` fails if a dependency of the `merge-queue` variant is not also
+run for PRs, since the required check could then never pass. Note that the opposite is not required.
+PRs can run tasks that are not required by the merge queue.
+
+The `github_pr_aliases` config is generated because part of it is derived from each variant's task
+list rather than written out by hand:
+
+```bash
+go run evergreen/generator/main.go
+```
+
+That prints the block to stdout. Replace the `github_pr_aliases` block in `common.yml` with its
+output. A unit test in `evergreen` fails if the two ever drift apart.
 
 ## JIRA Tickets
 
@@ -63,15 +181,48 @@ This will update our `go.{mod,sum}` files, vendor the dependency, update the SBO
 Note that you _cannot_ just use `go get` to add or update dependencies, because it doesn't update
 all of these other files that need to be updated when dependencies change.
 
+### AWS Profile for SBOM Updates
+
+In order for the SBOM update script to work, you must have an AWS profile named
+"ECRScopedAccess-901841024863" configured. The config in your `~/.aws/config` file should look like
+this:
+
+```toml
+[profile ECRScopedAccess-901841024863]
+region = us-east-1
+sso_account_id = 901841024863
+sso_role_name = ECRScopedAccess
+sso_start_url = <same as other profiles or ask in Slack>
+sso_region = us-east-1
+```
+
+In order to actually log in to this profile, run this command:
+
+```
+aws sso login --profile ECRScopedAccess-901841024863
+```
+
+In order for this to succeed, you must be a member of the `devprod-platforms-ecr-users` Mana group.
+
 ## Testing
 
-You will need a MongoDB server listening on `localhost:33333` to run the integration tests locally.
-You can use the [`mlaunch` tool](http://blog.rueckstiess.com/mtools/mlaunch.html) to make this
-simple:
+You will need a MongoDB server to run the integration tests locally. We have scripts in `scripts/`
+to start clusters with various topologies:
 
 ```
-$> mlaunch init --replicaset --port 33333
+# standalone mongod (the default)
+$> ./scripts/start-test-cluster.sh
+# three-node replica set
+$> ./scripts/start-test-cluster.sh --topology replset
+# two-shard cluster with a mongos
+$> ./scripts/start-test-cluster.sh --topology sharded
 ```
+
+The runner will pick random free ports for the cluster and print out a connection string when it's
+done. Setting that connection string in the `TOOLS_TESTING_MONGOD` env var will make the tests use
+this cluster.
+
+Stop the cluster with `./scripts/stop-test-cluster.sh`.
 
 To run unit and integration tests:
 
@@ -84,26 +235,13 @@ If `TOOLS_TESTING_UNIT` is set to a true value in the shell environment, unit te
 If `TOOLS_TESTING_INTEGRATION` is set to a true value in the shell environment, integration tests
 will run.
 
-Integration tests require a `mongod` (running on port 33333) while unit tests do not.
+Integration tests require a `mongod` while unit tests do not.
 
 Example of how to run a specific integration test:
 
 ```
-TOOLS_TESTING_INTEGRATION=true go test -v ./... -run TestImportDocuments
+TOOLS_TESTING_MONGOD='mongodb://...' TOOLS_TESTING_INTEGRATION=true go test -v ./... -run TestImportDocuments
 ```
-
-To run the quality assurance tests, you need to have the latest stable version of the rebuilt tools,
-`mongod`, `mongos`, and `mongo` in your current working directory.
-
-```
-cd test/qa-tests
-python buildscripts/smoke.py bson export files import oplog restore stat top
-```
-
-_Some tests require older binaries that are named accordingly (e.g. `mongod-2.4`, `mongod-2.6`,
-etc). You can use
-[setup_multiversion_mongodb.py](test/qa-tests/buildscripts/setup_multiversion_mongodb.py) to
-download those binaries_
 
 ### Writing Tests
 

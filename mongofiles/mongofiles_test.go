@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,43 +21,36 @@ import (
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/mongodb/mongo-tools/common/testtype"
-	"github.com/mongodb/mongo-tools/common/testutil"
-	"github.com/mongodb/mongo-tools/common/util"
 	"github.com/mongodb/mongo-tools/common/wcwrapper"
 	. "github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 )
 
 var (
-	testDB     = "mongofiles_test_db"
-	testServer = "localhost"
-	testPort   = db.DefaultTestPort
+	testDB = "mongofiles_test_db"
 
-	ssl        = testutil.GetSSLOptions()
-	auth       = testutil.GetAuthOptions()
-	connection = &options.Connection{
-		Host: testServer,
-		Port: testPort,
-	}
-	toolOptions = &options.ToolOptions{
-		SSL:          &ssl,
-		Connection:   connection,
-		Auth:         &auth,
-		Verbosity:    &options.Verbosity{},
-		URI:          &options.URI{},
-		WriteConcern: wcwrapper.Majority(),
-	}
-	testFiles = map[string]bson.ObjectID{
+	ssl         = testopts.GetSSLOptions()
+	toolOptions = mustGetToolOptions()
+	testFiles   = map[string]bson.ObjectID{
 		"testfile1": bson.NewObjectID(),
 		"testfile2": bson.NewObjectID(),
 		"testfile3": bson.NewObjectID(),
 		"testfile4": bson.NewObjectID(),
 	}
 )
+
+func mustGetToolOptions() *options.ToolOptions {
+	toolOptions, err := testopts.GetToolOptions()
+	if err != nil {
+		panic(fmt.Sprintf("could not get tool options: %v", err))
+	}
+
+	return toolOptions
+}
 
 // put in some test data into GridFS.
 func setUpGridFSTestData() (map[string]int, error) {
@@ -116,23 +110,32 @@ func tearDownGridFSTestData(t *testing.T) error {
 	return nil
 }
 
-func simpleMongoFilesInstanceWithID(command, ID string) (*MongoFiles, error) {
-	return simpleMongoFilesInstanceWithFilenameAndID(command, "", ID)
+func simpleMongoFilesInstanceWithID(t *testing.T, command, ID string) (*MongoFiles, error) {
+	t.Helper()
+	return simpleMongoFilesInstanceWithFilenameAndID(t, command, "", ID)
 }
 
-func simpleMongoFilesInstanceWithFilename(command, fname string) (*MongoFiles, error) {
-	return simpleMongoFilesInstanceWithFilenameAndID(command, fname, "")
+func simpleMongoFilesInstanceWithFilename(
+	t *testing.T,
+	command, fname string,
+) (*MongoFiles, error) {
+	t.Helper()
+	return simpleMongoFilesInstanceWithFilenameAndID(t, command, fname, "")
 }
 
-func simpleMongoFilesInstanceCommandOnly(command string) (*MongoFiles, error) {
-	return simpleMongoFilesInstanceWithFilenameAndID(command, "", "")
+func simpleMongoFilesInstanceCommandOnly(t *testing.T, command string) (*MongoFiles, error) {
+	t.Helper()
+	return simpleMongoFilesInstanceWithFilenameAndID(t, command, "", "")
 }
 
 func simpleMongoFilesInstanceWithMultipleFileNames(
+	t *testing.T,
 	command string,
 	fnames ...string,
 ) (*MongoFiles, error) {
-	mongofiles, err := simpleMongoFilesInstanceCommandOnly(command)
+	t.Helper()
+
+	mongofiles, err := simpleMongoFilesInstanceCommandOnly(t, command)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +144,16 @@ func simpleMongoFilesInstanceWithMultipleFileNames(
 	return mongofiles, nil
 }
 
-func simpleMongoFilesInstanceWithFilenameAndID(command, fname, ID string) (*MongoFiles, error) {
+// An unclosed session provider leaves the driver's topology-monitoring
+// goroutines running for the remainder of the test binary's run, so the
+// returned MongoFiles is closed when the test ends and must not be used after
+// that.
+func simpleMongoFilesInstanceWithFilenameAndID(
+	t *testing.T,
+	command, fname, ID string,
+) (*MongoFiles, error) {
+	t.Helper()
+
 	sessionProvider, err := db.NewSessionProvider(*toolOptions)
 	if err != nil {
 		return nil, err
@@ -156,6 +168,7 @@ func simpleMongoFilesInstanceWithFilenameAndID(command, fname, ID string) (*Mong
 		FileName:        fname,
 		Id:              ID,
 	}
+	t.Cleanup(mongofiles.Close)
 
 	return &mongofiles, nil
 }
@@ -172,7 +185,11 @@ func simpleMockMongoFilesInstanceWithFilename(command, fname string) *MongoFiles
 	}
 }
 
-func getMongofilesWithArgs(args ...string) (*MongoFiles, error) {
+// The returned MongoFiles is closed when the test ends, for the same reason as
+// simpleMongoFilesInstanceWithFilenameAndID, and must not be used after that.
+func getMongofilesWithArgs(t *testing.T, args ...string) (*MongoFiles, error) {
+	t.Helper()
+
 	opts, err := ParseOptions(args, "", "")
 	if err != nil {
 		return nil, err
@@ -182,6 +199,7 @@ func getMongofilesWithArgs(args ...string) (*MongoFiles, error) {
 	if err != nil {
 		return nil, err
 	}
+	t.Cleanup(mf.Close)
 
 	return mf, nil
 }
@@ -249,8 +267,10 @@ func getFilesAndBytesFromLines(lines []string) map[string]int {
 	return results
 }
 
-func getFilesAndBytesListFromGridFS() (map[string]int, error) {
-	mfAfter, err := simpleMongoFilesInstanceCommandOnly("list")
+func getFilesAndBytesListFromGridFS(t *testing.T) (map[string]int, error) {
+	t.Helper()
+
+	mfAfter, err := simpleMongoFilesInstanceCommandOnly(t, "list")
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +401,7 @@ func TestMongoFilesCommands(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		Convey("Testing the 'list' command with a file that isn't in GridFS should", func() {
-			mf, err := simpleMongoFilesInstanceWithFilename("list", "gibberish")
+			mf, err := simpleMongoFilesInstanceWithFilename(t, "list", "gibberish")
 			So(err, ShouldBeNil)
 			So(mf, ShouldNotBeNil)
 
@@ -393,7 +413,7 @@ func TestMongoFilesCommands(t *testing.T) {
 		})
 
 		Convey("Testing the 'list' command with files that are in GridFS should", func() {
-			mf, err := simpleMongoFilesInstanceWithFilename("list", "testf")
+			mf, err := simpleMongoFilesInstanceWithFilename(t, "list", "testf")
 			So(err, ShouldBeNil)
 			So(mf, ShouldNotBeNil)
 
@@ -411,7 +431,7 @@ func TestMongoFilesCommands(t *testing.T) {
 		})
 
 		Convey("Testing the 'search' command with files that are in GridFS should", func() {
-			mf, err := simpleMongoFilesInstanceWithFilename("search", "file")
+			mf, err := simpleMongoFilesInstanceWithFilename(t, "search", "file")
 			So(err, ShouldBeNil)
 			So(mf, ShouldNotBeNil)
 
@@ -429,7 +449,7 @@ func TestMongoFilesCommands(t *testing.T) {
 		})
 
 		Convey("Testing the 'get' command with a file that is in GridFS should", func() {
-			mf, err := simpleMongoFilesInstanceWithFilename("get", "testfile1")
+			mf, err := simpleMongoFilesInstanceWithFilename(t, "get", "testfile1")
 			So(err, ShouldBeNil)
 			So(mf, ShouldNotBeNil)
 
@@ -474,7 +494,7 @@ func TestMongoFilesCommands(t *testing.T) {
 
 		Convey("Testing the 'get' command with multiple files that are in GridFS should", func() {
 			localTestFiles := []string{"testfile1", "testfile2", "testfile3"}
-			mf, err := simpleMongoFilesInstanceWithMultipleFileNames("get", localTestFiles...)
+			mf, err := simpleMongoFilesInstanceWithMultipleFileNames(t, "get", localTestFiles...)
 			So(err, ShouldBeNil)
 			So(mf, ShouldNotBeNil)
 
@@ -525,11 +545,11 @@ func TestMongoFilesCommands(t *testing.T) {
 		})
 
 		Convey("Testing the 'get_id' command with a file that is in GridFS should", func() {
-			_, err := simpleMongoFilesInstanceWithFilename("get", "testfile1")
+			_, err := simpleMongoFilesInstanceWithFilename(t, "get", "testfile1")
 			So(err, ShouldBeNil)
 
 			id := idOfFile("testfile1")
-			mf, err := simpleMongoFilesInstanceWithID("get_id", id)
+			mf, err := simpleMongoFilesInstanceWithID(t, "get_id", id)
 			So(err, ShouldBeNil)
 			So(mf, ShouldNotBeNil)
 
@@ -935,7 +955,7 @@ func TestMongoFilesCommands(t *testing.T) {
 		})
 
 		Convey("Testing the 'get_regex' command should", func() {
-			mf, err := simpleMongoFilesInstanceCommandOnly(GetRegex)
+			mf, err := simpleMongoFilesInstanceCommandOnly(t, GetRegex)
 			So(err, ShouldBeNil)
 
 			Convey(
@@ -1005,12 +1025,12 @@ func TestMongoFilesCommands(t *testing.T) {
 
 		Convey("Testing the 'put' command with multiple lorem ipsum files bytes should", func() {
 			localTestFiles := []string{
-				util.ToUniversalPath("testdata/lorem_ipsum_multi_args_0.txt"),
-				util.ToUniversalPath("testdata/lorem_ipsum_multi_args_1.txt"),
-				util.ToUniversalPath("testdata/lorem_ipsum_multi_args_2.txt"),
+				filepath.FromSlash("testdata/lorem_ipsum_multi_args_0.txt"),
+				filepath.FromSlash("testdata/lorem_ipsum_multi_args_1.txt"),
+				filepath.FromSlash("testdata/lorem_ipsum_multi_args_2.txt"),
 			}
 
-			mf, err := simpleMongoFilesInstanceWithMultipleFileNames("put", localTestFiles...)
+			mf, err := simpleMongoFilesInstanceWithMultipleFileNames(t, "put", localTestFiles...)
 			So(err, ShouldBeNil)
 
 			var buff bytes.Buffer
@@ -1036,7 +1056,7 @@ func TestMongoFilesCommands(t *testing.T) {
 			})
 
 			Convey("and files should exist in GridFS", func() {
-				bytesGotten, err := getFilesAndBytesListFromGridFS()
+				bytesGotten, err := getFilesAndBytesListFromGridFS(t)
 				So(err, ShouldBeNil)
 
 				// Check that the only files included are the local test
@@ -1055,7 +1075,7 @@ func TestMongoFilesCommands(t *testing.T) {
 					const localFileName = "lorem_ipsum_copy.txt"
 					buff.Truncate(0)
 					for i, testFile := range localTestFiles {
-						mfAfter, err := simpleMongoFilesInstanceWithFilename("get", testFile)
+						mfAfter, err := simpleMongoFilesInstanceWithFilename(t, "get", testFile)
 						So(err, ShouldBeNil)
 						So(mf, ShouldNotBeNil)
 
@@ -1113,7 +1133,7 @@ func TestMongoFilesCommands(t *testing.T) {
 		)
 
 		Convey("Testing the 'delete' command with a file that is in GridFS should", func() {
-			mf, err := simpleMongoFilesInstanceWithFilename("delete", "testfile2")
+			mf, err := simpleMongoFilesInstanceWithFilename(t, "delete", "testfile2")
 			So(err, ShouldBeNil)
 			So(mf, ShouldNotBeNil)
 
@@ -1127,7 +1147,7 @@ func TestMongoFilesCommands(t *testing.T) {
 				So(buff.Len(), ShouldNotEqual, 0)
 
 				Convey("check that the file has been deleted from GridFS", func() {
-					bytesGotten, err := getFilesAndBytesListFromGridFS()
+					bytesGotten, err := getFilesAndBytesListFromGridFS(t)
 					So(err, ShouldEqual, nil)
 					So(len(bytesGotten), ShouldEqual, len(testFiles)-1)
 
@@ -1138,11 +1158,11 @@ func TestMongoFilesCommands(t *testing.T) {
 
 		Convey("Testing the 'delete_id' command with a file that is in GridFS should", func() {
 			// hack to grab an _id
-			_, err := simpleMongoFilesInstanceWithFilename("get", "testfile2")
+			_, err := simpleMongoFilesInstanceWithFilename(t, "get", "testfile2")
 			So(err, ShouldBeNil)
 
 			idString := idOfFile("testfile2")
-			mf, err := simpleMongoFilesInstanceWithID("delete_id", idString)
+			mf, err := simpleMongoFilesInstanceWithID(t, "delete_id", idString)
 			So(err, ShouldBeNil)
 			So(mf, ShouldNotBeNil)
 
@@ -1156,7 +1176,7 @@ func TestMongoFilesCommands(t *testing.T) {
 				So(buff.Len(), ShouldNotEqual, 0)
 
 				Convey("check that the file has been deleted from GridFS", func() {
-					bytesGotten, err := getFilesAndBytesListFromGridFS()
+					bytesGotten, err := getFilesAndBytesListFromGridFS(t)
 					So(err, ShouldEqual, nil)
 					So(len(bytesGotten), ShouldEqual, len(testFiles)-1)
 
@@ -1180,29 +1200,56 @@ func TestDefaultWriteConcern(t *testing.T) {
 	}
 
 	Convey("with a URI that doesn't specify write concern", t, func() {
-		mf, err := getMongofilesWithArgs("get", "filename", "--uri", "mongodb://localhost:33333")
+		mf, err := getMongofilesWithArgs(
+			t,
+			"get", "filename",
+			"--uri", uriWithoutWriteConcern(toolOptions.URI.ConnectionString),
+		)
 		So(err, ShouldBeNil)
 		So(
 			mf.ToolOptions.WriteConcern,
 			ShouldResemble,
-			writeconcern.Majority(),
+			wcwrapper.Majority(),
 		)
 	})
 
 	Convey("with no URI and no write concern option", t, func() {
-		mf, err := getMongofilesWithArgs("get", "filename", "--port", "33333")
+		mf, err := getMongofilesWithArgs(
+			t,
+			"get", "filename",
+			"--host", strings.Join(toolOptions.URI.ConnString.Hosts, ","),
+		)
 		So(err, ShouldBeNil)
 		So(
 			mf.ToolOptions.WriteConcern,
 			ShouldResemble,
-			writeconcern.Majority(),
+			wcwrapper.Majority(),
 		)
 	})
+}
+
+// TOOLS_TESTING_MONGOD may name a write concern, which would make the subtest above assert on that
+// instead of on the default it is testing for.
+func uriWithoutWriteConcern(uri string) string {
+	parsed, err := url.Parse(uri)
+	So(err, ShouldBeNil)
+
+	query := parsed.Query()
+	for key := range query {
+		switch strings.ToLower(key) {
+		case "w", "journal", "j", "wtimeoutms", "wtimeout", "safe":
+			query.Del(key)
+		}
+	}
+	parsed.RawQuery = query.Encode()
+
+	return parsed.String()
 }
 
 func runPutIDTestCase(idToTest string, t *testing.T) {
 	remoteName := "remoteName"
 	mongoFilesInstance, err := simpleMongoFilesInstanceWithFilenameAndID(
+		t,
 		"put_id",
 		remoteName,
 		idToTest,
@@ -1213,7 +1260,7 @@ func runPutIDTestCase(idToTest string, t *testing.T) {
 
 	So(err, ShouldBeNil)
 	So(mongoFilesInstance, ShouldNotBeNil)
-	mongoFilesInstance.StorageOptions.LocalFileName = util.ToUniversalPath(
+	mongoFilesInstance.StorageOptions.LocalFileName = filepath.FromSlash(
 		"testdata/lorem_ipsum_287613_bytes.txt",
 	)
 
@@ -1224,13 +1271,13 @@ func runPutIDTestCase(idToTest string, t *testing.T) {
 	So(buff.Len(), ShouldNotEqual, 0)
 
 	t.Log("and its filename should exist when the 'list' command is run")
-	bytesGotten, err := getFilesAndBytesListFromGridFS()
+	bytesGotten, err := getFilesAndBytesListFromGridFS(t)
 	So(err, ShouldBeNil)
 	So(bytesGotten, ShouldContainKey, remoteName)
 
 	t.Log("and get_id should have exactly the same content as the original file")
 
-	mfAfter, err := simpleMongoFilesInstanceWithID("get_id", idToTest)
+	mfAfter, err := simpleMongoFilesInstanceWithID(t, "get_id", idToTest)
 	So(err, ShouldBeNil)
 	So(mfAfter, ShouldNotBeNil)
 
@@ -1242,7 +1289,7 @@ func runPutIDTestCase(idToTest string, t *testing.T) {
 	So(str, ShouldEqual, "")
 	So(buff.Len(), ShouldNotEqual, 0)
 
-	loremIpsumOrig, err := os.Open(util.ToUniversalPath("testdata/lorem_ipsum_287613_bytes.txt"))
+	loremIpsumOrig, err := os.Open(filepath.FromSlash("testdata/lorem_ipsum_287613_bytes.txt"))
 	So(err, ShouldBeNil)
 
 	loremIpsumCopy, err := os.Open("lorem_ipsum_copy.txt")

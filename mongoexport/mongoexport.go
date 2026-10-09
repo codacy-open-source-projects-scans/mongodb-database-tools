@@ -124,6 +124,7 @@ func New(opts Options) (*MongoExport, error) {
 
 	exporter.version, err = provider.ServerVersionArray()
 	if err != nil {
+		provider.Close()
 		return nil, util.SetupError{
 			Err:     err,
 			Message: "failed to get server version",
@@ -239,7 +240,7 @@ func (exp *MongoExport) GetOutputWriter() (io.WriteCloser, error) {
 			return nil, err
 		}
 
-		file, err := os.Create(util.ToUniversalPath(exp.OutputOpts.OutputFile))
+		file, err := os.Create(filepath.FromSlash(exp.OutputOpts.OutputFile))
 		if err != nil {
 			return nil, err
 		}
@@ -258,7 +259,7 @@ func makeFieldSelector(fields string) bson.M {
 		return selector
 	}
 
-	for _, field := range strings.Split(fields, ",") {
+	for field := range strings.SplitSeq(fields, ",") {
 		// Projections like "a.0" work fine for nested documents not for arrays
 		// - if passed directly to mongod. To handle this, we have to retrieve
 		// the entire top-level document and then filter afterwards. An exception
@@ -365,6 +366,15 @@ func (exp *MongoExport) getCursor() (*mongo.Cursor, error) {
 		findOpts.SetProjection(makeFieldSelector(exp.OutputOpts.Fields))
 	}
 
+	// An export with neither a query nor a sort is a deliberate full collection scan. Saying so
+	// with a $natural hint exempts it from the server's maxEstimatedScanBytes rejection
+	// (SERVER-127688) without changing the plan the server would have chosen anyway. We must not
+	// do this when there is a query or a sort, either of which could be served by an index.
+	sorted := exp.InputOpts != nil && exp.InputOpts.Sort != ""
+	if len(query) == 0 && !sorted {
+		findOpts.SetHint(bson.D{{"$natural", 1}})
+	}
+
 	return coll.Find(context.TODO(), query, findOpts)
 }
 
@@ -402,18 +412,22 @@ func (exp *MongoExport) verifyCollectionExists() (bool, error) {
 // Internal function that handles exporting to the given writer. Used primarily
 // for testing, because it bypasses writing to the file system.
 func (exp *MongoExport) exportInternal(out io.Writer) (int64, error) {
-	// Check if the collection exists before starting export
-	exists, err := exp.verifyCollectionExists()
-	if err != nil || !exists {
-		return 0, err
-	}
-
+	// Servers that support the rawData API (8.3+) use viewless timeseries collections, where the
+	// legacy system.buckets namespace no longer exists. This is checked before verifying that the
+	// collection exists, since verifyCollectionExists would otherwise report it as missing and
+	// return early without surfacing the more useful error below.
 	if exp.version.SupportsRawData() &&
 		strings.HasPrefix(exp.ToolOptions.Collection, common.TimeseriesBucketPrefix) {
 		return 0, fmt.Errorf(
 			"mongoexport does not support exporting system.buckets collections with server versions 8.3+ (detected version: %s)",
 			exp.version,
 		)
+	}
+
+	// Check if the collection exists before starting export
+	exists, err := exp.verifyCollectionExists()
+	if err != nil || !exists {
+		return 0, err
 	}
 
 	max, err := exp.getCount()

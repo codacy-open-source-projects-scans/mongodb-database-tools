@@ -18,18 +18,26 @@ import (
 	"testing"
 
 	"github.com/mongodb/mongo-tools/common/db"
+	"github.com/mongodb/mongo-tools/common/db/dsctest"
 	"github.com/mongodb/mongo-tools/common/options"
-	"github.com/mongodb/mongo-tools/common/wcwrapper"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
 )
 
-// GetBareSession returns an mgo.Session from the environment or
-// from a default host and port.
-func GetBareSession() (*mongo.Client, error) {
-	sessionProvider, _, err := GetBareSessionProvider()
+// GetBareSession returns a client from the environment or from a default host
+// and port. The underlying session provider is closed when the test ends, so
+// the returned client must not be used after that.
+func GetBareSession(t *testing.T) (*mongo.Client, error) {
+	return GetBareSessionForURI(t, os.Getenv(testopts.URIEnvVar))
+}
+
+// GetBareSessionForURI is GetBareSession for a specific connection string.
+func GetBareSessionForURI(t *testing.T, uri string) (*mongo.Client, error) {
+	t.Helper()
+
+	sessionProvider, _, err := GetBareSessionProviderForURI(t, uri)
 	if err != nil {
 		return nil, err
 	}
@@ -41,9 +49,28 @@ func GetBareSession() (*mongo.Client, error) {
 }
 
 // GetBareSessionProvider returns a session provider from the environment or
-// from a default host and port.
-func GetBareSessionProvider() (*db.SessionProvider, *options.ToolOptions, error) {
-	toolOptions, err := GetToolOptions()
+// from a default host and port. The provider is closed when the test ends, so
+// the caller must not close it, and must not use it after that.
+//
+// An unclosed provider leaves the driver's topology-monitoring goroutines
+// running for the remainder of the test binary's run, which is why this takes a
+// *testing.T rather than leaving the close to each caller.
+func GetBareSessionProvider(
+	t *testing.T,
+) (*db.SessionProvider, *options.ToolOptions, error) {
+	t.Helper()
+
+	return GetBareSessionProviderForURI(t, os.Getenv(testopts.URIEnvVar))
+}
+
+// GetBareSessionProviderForURI is GetBareSessionProvider for a specific connection string.
+func GetBareSessionProviderForURI(
+	t *testing.T,
+	uri string,
+) (*db.SessionProvider, *options.ToolOptions, error) {
+	t.Helper()
+
+	toolOptions, err := testopts.GetToolOptionsForURI(uri)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"error getting tool options to create a bare session provider: %w",
@@ -55,78 +82,9 @@ func GetBareSessionProvider() (*db.SessionProvider, *options.ToolOptions, error)
 	if err != nil {
 		return nil, nil, err
 	}
+	t.Cleanup(sessionProvider.Close)
 
 	return sessionProvider, toolOptions, nil
-}
-
-const uriEnvVar = "TOOLS_TESTING_MONGOD"
-
-func GetToolOptions() (*options.ToolOptions, error) {
-	var toolOptions *options.ToolOptions
-	// get ToolOptions from URI or defaults
-	if uri := os.Getenv(uriEnvVar); uri != "" {
-		parse, err := connstring.ParseAndValidate(uri)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"%#q from the %#q env var is not a valid connection string: %w",
-				uri,
-				uriEnvVar,
-				err,
-			)
-		}
-
-		fakeArgs := []string{"--uri=" + uri}
-		opts := options.EnabledOptions{Auth: parse.UsernameSet, URI: true}
-		toolOptions = options.New("mongodump", "", "", "", true, opts)
-
-		_, err = toolOptions.ParseArgs(fakeArgs)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"could not create toolOptions with %#q from the %#q env var: %w",
-				uri,
-				uriEnvVar,
-				err,
-			)
-		}
-	} else {
-		ssl := GetSSLOptions()
-		auth := GetAuthOptions()
-		connection := &options.Connection{
-			Host: "localhost",
-			Port: db.DefaultTestPort,
-		}
-		toolOptions = &options.ToolOptions{
-			General:      &options.General{},
-			SSL:          &ssl,
-			Connection:   connection,
-			Auth:         &auth,
-			Verbosity:    &options.Verbosity{},
-			URI:          &options.URI{},
-			Namespace:    &options.Namespace{},
-			WriteConcern: wcwrapper.Majority(),
-		}
-	}
-
-	err := toolOptions.NormalizeOptionsAndURI()
-	if err != nil {
-		return nil, err
-	}
-
-	return toolOptions, nil
-}
-
-func GetBareArgs() []string {
-	args := []string{}
-
-	args = append(args, GetSSLArgs()...)
-	args = append(args, GetAuthArgs()...)
-	if uri := os.Getenv(uriEnvVar); uri != "" {
-		args = append(args, "--uri", uri)
-	} else {
-		args = append(args, "--host", "localhost", "--port", db.DefaultTestPort)
-	}
-
-	return args
 }
 
 // GetFCV returns the featureCompatibilityVersion string for an mgo Session
@@ -179,7 +137,7 @@ func CompareFCV(x, y string) (int, error) {
 }
 
 func SkipIfFCVLessThan(t *testing.T, versionStr string, reason string) {
-	session, err := GetBareSession()
+	session, err := GetBareSession(t)
 	require.NoError(t, err)
 
 	fcv := GetFCV(session)
@@ -195,9 +153,24 @@ func SkipIfFCVLessThan(t *testing.T, versionStr string, reason string) {
 	}
 }
 
+// SkipUnlessStandalone skips the test unless it is connected to a standalone
+// server. Some operations (e.g. writing local.oplog.rs as a collection) are
+// only permitted on a standalone: a replica set rejects direct oplog writes and
+// mongos rejects writes to the local database.
+func SkipUnlessStandalone(t *testing.T) {
+	sessionProvider, _, err := GetBareSessionProvider(t)
+	require.NoError(t, err)
+
+	nodeType, err := sessionProvider.GetNodeType()
+	require.NoError(t, err)
+	if nodeType != db.Standalone {
+		t.Skipf("Skipping test because it requires a standalone server, not %q", nodeType)
+	}
+}
+
 func dottedStringToSlice(s string) ([]int, error) {
 	parts := make([]int, 0, 2)
-	for _, v := range strings.Split(s, ".") {
+	for v := range strings.SplitSeq(s, ".") {
 		i, err := strconv.Atoi(v)
 		if err != nil {
 			return parts, err
@@ -279,7 +252,7 @@ var atlasDomains = []string{
 
 // SkipForAtlasCluster will skip the test if `TOOLS_TESTING_MONGOD` is an Atlas URI.
 func SkipForAtlasCluster(t *testing.T, reason string) {
-	uri := os.Getenv(uriEnvVar)
+	uri := os.Getenv(testopts.URIEnvVar)
 	if uri == "" {
 		return
 	}
@@ -288,11 +261,39 @@ func SkipForAtlasCluster(t *testing.T, reason string) {
 		if strings.Contains(uri, d) {
 			t.Skipf(
 				"The %#q env var is for an Atlas cluster: %s",
-				uriEnvVar,
+				testopts.URIEnvVar,
 				reason,
 			)
 		}
 	}
+}
+
+// SkipForDisaggregatedStorage will skip the test if the server is running with disaggregated
+// storage (DSC) enabled.
+//
+// Use this for tests that depend on a server feature DSC does not support, naming that feature in
+// the reason. It deliberately keys off DSC rather than off the unsupported operation failing, so an
+// unexpected failure of that same operation elsewhere still fails the test loudly instead of
+// quietly skipping it.
+func SkipForDisaggregatedStorage(t *testing.T, reason string) {
+	t.Helper()
+
+	session, err := GetBareSession(t)
+	require.NoError(t, err, "getting a session to check for disaggregated storage")
+
+	dsctest.SkipForDisaggregatedStorage(t, session, reason)
+}
+
+// SkipUnlessDisaggregatedStorage will skip the test if the server is not running with disaggregated
+// storage (DSC) enabled.
+//
+// Use this for tests that exercise a guardrail that only fires on a DSC cluster, so they only run
+// against the DSC CI variant.
+func SkipUnlessDisaggregatedStorage(t *testing.T, reason string) {
+	session, err := GetBareSession(t)
+	require.NoError(t, err, "getting a session to check for disaggregated storage")
+
+	dsctest.SkipUnlessDisaggregatedStorage(t, session, reason)
 }
 
 // WriteTempFile writes the contents of r to a tempfile, then hands you back the (closed) file.

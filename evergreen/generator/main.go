@@ -12,10 +12,10 @@ func main() {
 		panic(err)
 	}
 
-	y, err := c.GitHubPRAliasesYAML()
+	pr, err := c.GitHubPRAliasesYAML()
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Println(y)
+	fmt.Println(pr)
 }

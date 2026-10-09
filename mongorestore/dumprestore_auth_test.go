@@ -8,12 +8,14 @@ package mongorestore
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/mongodb/mongo-tools/common/bsonutil"
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/options"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/mongodb/mongo-tools/common/testutil"
 	"github.com/mongodb/mongo-tools/mongodump"
@@ -39,9 +41,9 @@ func TestDumpRestoreEnforcesAuthRoles(t *testing.T) {
 		restoreFooUser     = "enforces_restfoo"
 	)
 
-	adminClient, err := testutil.GetBareSession()
+	adminClient, err := testutil.GetBareSession(t)
 	require.NoError(t, err)
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err)
 	serverVersion, err := sessionProvider.ServerVersionArray()
 	require.NoError(t, err)
@@ -252,7 +254,7 @@ func dumpRestorePreservesAdminUsersAndRoles(t *testing.T, backupRole, restoreRol
 		customRole2 = "preserves_custom2" // used in drop_restore_overrides_mutations subtest
 	)
 
-	adminClient, err := testutil.GetBareSession()
+	adminClient, err := testutil.GetBareSession(t)
 	require.NoError(t, err)
 
 	adminDB := adminClient.Database("admin")
@@ -460,7 +462,7 @@ func dumpRestoreSingleDBWithUsersAndRoles(t *testing.T) {
 		barUser2Name       = "singledb_baruser2"  // used in admin_db subtest
 	)
 
-	adminClient, err := testutil.GetBareSession()
+	adminClient, err := testutil.GetBareSession(t)
 	require.NoError(t, err)
 
 	adminDB := adminClient.Database("admin")
@@ -908,10 +910,248 @@ func dumpRestoreSingleDBWithUsersAndRoles(t *testing.T) {
 	})
 }
 
+// TestRestoreWithDBUserPreservesIndexes covers the parts of the legacy
+// restorewithauth.js (SERVER-4972) that TestDumpRestoreEnforcesAuthRoles does
+// not: that a restore without credentials against an auth-enabled server is
+// rejected and inserts nothing, and that restoring as a non-admin,
+// per-database user still preserves secondary indexes on the round trip. A
+// collection with an extra index ends up with both _id and that index, while
+// a collection with only _id keeps just _id.
+func TestRestoreWithDBUserPreservesIndexes(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testtype.SkipUnlessTestType(t, testtype.AuthTestType)
+
+	const (
+		dbName = "testdr_restorewithauth"
+		dbUser = "restorewithauth_user"
+	)
+
+	adminClient, err := testutil.GetBareSession(t)
+	require.NoError(t, err)
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
+	require.NoError(t, err)
+	serverVersion, err := sessionProvider.ServerVersionArray()
+	require.NoError(t, err)
+
+	adminDB := adminClient.Database("admin")
+	testDB := adminClient.Database(dbName)
+	barColl := testDB.Collection("bar")
+	bazColl := testDB.Collection("baz")
+
+	cleanup := func() {
+		silentDropUser(adminDB, dbUser)
+		_ = testDB.Drop(context.Background())
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	ctx := context.Background()
+	for i := range 4 {
+		_, err = barColl.InsertOne(ctx, bson.D{{Key: "x", Value: i}})
+		require.NoError(t, err)
+		_, err = bazColl.InsertOne(ctx, bson.D{{Key: "x", Value: i}})
+		require.NoError(t, err)
+	}
+	_, err = barColl.Indexes().
+		CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "x", Value: 1}}})
+	require.NoError(t, err, "creating secondary index on bar")
+
+	// readWrite includes the createCollection/createIndex/insert privileges that
+	// mongorestore needs to restore data and indexes into a single database.
+	mustCreateUser(t, adminDB, dbUser, "password", bson.A{dbRole("readWrite", dbName)})
+
+	dumpDir, cleanDump := testutil.MakeTempDir(t)
+	defer cleanDump()
+
+	dumpOpts := baseToolOpts(t)
+	dumpOpts.Namespace = &options.Namespace{DB: dbName}
+	require.NoError(t, runDump(t, dumpOpts, dumpDir, nil), "dump db as admin")
+
+	require.NoError(t, testDB.Drop(ctx), "dropping db before restore")
+
+	noAuthOpts := toolOptsNoAuth(t)
+	noAuthErr := runRestore(t, noAuthOpts, dumpDir, nil)
+	// On MongoDB 4.2 with TLS, the client cert used in CI acts as an implicit intra-cluster
+	// x.509 credential, allowing a "no auth" connection to succeed. This was tightened in 4.4,
+	// so these assertions are only reliable on 4.4+.
+	if serverVersion.GTE(db.Version{4, 4, 0}) {
+		assert.ErrorContains(
+			t,
+			noAuthErr,
+			"requires authentication",
+			"restore without credentials should fail",
+		)
+		assert.Equal(
+			t,
+			int64(0),
+			docCount(t, barColl),
+			"restore without credentials should not insert anything",
+		)
+	}
+
+	restoreOpts := toolOptsForUser(t, dbUser, "password")
+	require.NoError(
+		t,
+		runRestore(t, restoreOpts, dumpDir, nil),
+		"restore as a non-admin per-db user",
+	)
+
+	assert.Equal(t, int64(4), docCount(t, barColl), "bar restored with 4 documents")
+	assert.Equal(t, int64(4), docCount(t, bazColl), "baz restored with 4 documents")
+	assert.Equal(t, 2, countIndexes(t, barColl), "bar has _id and x indexes after restore")
+	assert.Equal(t, 1, countIndexes(t, bazColl), "baz has only its _id index after restore")
+}
+
+// TestDumpAdminSystemProfileAsBackupUser checks that a user holding only the backup role can dump
+// the admin database along with admin.system.profile, and that what lands on disk is readable
+// profiler data. admin is the one database whose system collections are dumped:
+// `shouldSkipSystemNamespace` leaves out only `admin.system.keys`, while for every other database
+// it skips `system.*`.
+func TestDumpAdminSystemProfileAsBackupUser(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testtype.SkipUnlessTestType(t, testtype.AuthTestType)
+
+	const (
+		backupUser = "dumpauth_backup"
+		backupPass = "password"
+		collName   = "dumpauth_testcol"
+		docCount   = 100
+	)
+
+	adminClient, err := testutil.GetBareSession(t)
+	require.NoError(t, err)
+
+	adminDB := adminClient.Database("admin")
+	coll := adminDB.Collection(collName)
+
+	t.Cleanup(func() {
+		silentDropUser(adminDB, backupUser)
+		require.NoError(t, coll.Drop(context.Background()), "dropping the test collection")
+	})
+	mustCreateUser(t, adminDB, backupUser, backupPass, bson.A{adminRole("backup")})
+
+	// Profiling has to be on for the server to write admin.system.profile at all, and it is global
+	// to the database, so it is put back the way it was found. The profile collection can only be
+	// dropped while profiling is off, and it is capped, so clearing it here is what keeps entries
+	// from earlier runs of this test out of the assertions below.
+	previousLevel := setProfilingLevel(t, adminDB, 0)
+	profileColl := adminDB.Collection("system.profile")
+	require.NoError(
+		t,
+		profileColl.Drop(context.Background()),
+		"can clear admin.system.profile before profiling this run",
+	)
+	setProfilingLevel(t, adminDB, 2)
+	t.Cleanup(func() { setProfilingLevel(t, adminDB, previousLevel) })
+
+	docs := make([]any, 0, docCount)
+	for i := range docCount {
+		docs = append(docs, bson.D{{"x", i}})
+	}
+	_, err = coll.InsertMany(context.Background(), docs)
+	require.NoError(t, err, "can insert the documents whose inserts get profiled")
+
+	profiledNS := adminDB.Name() + "." + collName
+	profiledInserts, err := profileColl.CountDocuments(
+		context.Background(),
+		bson.D{{"ns", profiledNS}, {"op", "insert"}},
+	)
+	require.NoError(t, err, "can count the profile entries for this run's inserts")
+	require.Positive(t, profiledInserts, "profiling recorded this run's inserts")
+
+	dumpDir, cleanDump := testutil.MakeTempDir(t)
+	defer cleanDump()
+
+	opts := toolOptsForUser(t, backupUser, backupPass)
+	opts.Namespace = &options.Namespace{DB: "admin"}
+	require.NoError(
+		t,
+		runDump(t, opts, dumpDir, nil),
+		"a user holding only the backup role can dump the admin database",
+	)
+
+	// Counting the entries that record this run's own inserts, rather than only checking that the
+	// file parses as BSON, is what tells profiler data apart from anything else that might have
+	// landed at this path.
+	profileEntries := readBSONFile(t, filepath.Join(dumpDir, "admin", "system.profile.bson"))
+	assert.Positive(
+		t,
+		insertEntriesForNS(profileEntries, profiledNS),
+		"the dumped admin.system.profile holds the profiler's record of this run's inserts",
+	)
+
+	assert.Len(
+		t,
+		readBSONFile(t, filepath.Join(dumpDir, "admin", collName+".bson")),
+		docCount,
+		"the dump also holds the ordinary collection in admin",
+	)
+}
+
+// insertEntriesForNS counts the profiler entries that record an insert into ns.
+func insertEntriesForNS(entries []bson.D, ns string) int {
+	matches := 0
+	for _, entry := range entries {
+		op, opErr := bsonutil.FindValueByKey("op", &entry)
+		entryNS, nsErr := bsonutil.FindValueByKey("ns", &entry)
+		if opErr != nil || nsErr != nil {
+			continue
+		}
+		if op == "insert" && entryNS == ns {
+			matches++
+		}
+	}
+
+	return matches
+}
+
+// setProfilingLevel sets the profiling level on db and returns the level that
+// was in effect beforehand.
+func setProfilingLevel(t *testing.T, db *mongo.Database, level int32) int32 {
+	t.Helper()
+
+	var res struct {
+		Was int32 `bson:"was"`
+	}
+	require.NoError(
+		t,
+		db.RunCommand(context.Background(), bson.D{{"profile", level}}).Decode(&res),
+		"can set the profiling level on %#q to %d",
+		db.Name(),
+		level,
+	)
+
+	return res.Was
+}
+
+// readBSONFile decodes every document in a .bson file written by mongodump.
+func readBSONFile(t *testing.T, path string) []bson.D {
+	t.Helper()
+
+	file, err := os.Open(path)
+	require.NoError(t, err, "the dump contains %#q", path)
+	defer file.Close()
+
+	source := db.NewDecodedBSONSource(db.NewBSONSource(file))
+	defer source.Close()
+
+	var docs []bson.D
+	for {
+		var doc bson.D
+		if !source.Next(&doc) {
+			break
+		}
+		docs = append(docs, doc)
+	}
+	require.NoError(t, source.Err(), "can decode %#q", path)
+
+	return docs
+}
+
 // baseToolOpts returns a fresh set of tool options from the environment.
 func baseToolOpts(t *testing.T) *options.ToolOptions {
 	t.Helper()
-	opts, err := testutil.GetToolOptions()
+	opts, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	return opts
 }
@@ -920,7 +1160,7 @@ func baseToolOpts(t *testing.T) *options.ToolOptions {
 // authentication overridden to use the given username and password.
 func toolOptsForUser(t *testing.T, username, password string) *options.ToolOptions {
 	t.Helper()
-	opts, err := testutil.GetToolOptions()
+	opts, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	opts.Auth = &options.Auth{
 		Username: username,
@@ -934,7 +1174,7 @@ func toolOptsForUser(t *testing.T, username, password string) *options.ToolOptio
 // authentication cleared. Connecting to an auth-required server will fail.
 func toolOptsNoAuth(t *testing.T) *options.ToolOptions {
 	t.Helper()
-	opts, err := testutil.GetToolOptions()
+	opts, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	opts.Auth = &options.Auth{}
 	return opts
@@ -1023,6 +1263,16 @@ func docCount(t *testing.T, coll *mongo.Collection) int64 {
 	count, err := coll.CountDocuments(context.Background(), bson.D{})
 	require.NoError(t, err)
 	return count
+}
+
+// countIndexes returns the number of indexes on the collection.
+func countIndexes(t *testing.T, coll *mongo.Collection) int {
+	t.Helper()
+	cursor, err := coll.Indexes().List(context.Background())
+	require.NoError(t, err, "listing indexes")
+	var indexes []bson.D
+	require.NoError(t, cursor.All(context.Background(), &indexes), "reading index list")
+	return len(indexes)
 }
 
 // mustCreateUser runs a createUser command on db, failing the test on error.

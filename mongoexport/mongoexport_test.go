@@ -25,9 +25,9 @@ import (
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/mongodb/mongo-tools/common/testutil"
-	"github.com/mongodb/mongo-tools/common/wcwrapper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -41,7 +41,7 @@ var (
 )
 
 func simpleMongoExportOpts() (Options, error) {
-	toolOptions, err := testutil.GetToolOptions()
+	toolOptions, err := testopts.GetToolOptions()
 	if err != nil {
 		return Options{}, fmt.Errorf(
 			"error getting tool options to create a mongoexport instance: %w",
@@ -102,7 +102,7 @@ func TestMongoExportTOOLS2174(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	log.SetWriter(io.Discard)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err, "no cluster available")
 
 	serverVersion, err := sessionProvider.ServerVersionArray()
@@ -155,9 +155,13 @@ func TestMongoExportTOOLS2174(t *testing.T) {
 // this is not a wired tiger collection.
 func TestMongoExportTOOLS1952(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it reads system.profile, and DSC does not support profile level 2",
+	)
 	log.SetWriter(io.Discard)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err, "no cluster available")
 
 	session, err := sessionProvider.GetSession()
@@ -243,7 +247,7 @@ func TestBadOptions(t *testing.T) {
 	dbName := "test"
 	collName := "mongoexport-bad-options"
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -329,7 +333,7 @@ func TestBrokenPipe(t *testing.T) {
 		collName = "docs"
 	)
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err)
 	client, err := sessionProvider.GetSession()
 	require.NoError(t, err)
@@ -346,7 +350,7 @@ func TestBrokenPipe(t *testing.T) {
 
 	args := append(
 		[]string{"run", filepath.Join("..", "mongoexport", "main")},
-		testutil.GetBareArgs()...,
+		testopts.GetBareArgs()...,
 	)
 	args = append(args, "--db", dbName, "--collection", collName)
 	testutil.AssertBrokenPipeHandled(t, exec.Command("go", args...))
@@ -359,7 +363,7 @@ func TestExportNamespaceValidation(t *testing.T) {
 	log.SetWriter(io.Discard)
 
 	for _, dbName := range []string{"test.bar", `test"bar`} {
-		toolOptions, err := testutil.GetToolOptions()
+		toolOptions, err := testopts.GetToolOptions()
 		require.NoError(t, err)
 		toolOptions.Namespace = &options.Namespace{DB: dbName, Collection: "foo"}
 		_, err = New(Options{
@@ -370,7 +374,7 @@ func TestExportNamespaceValidation(t *testing.T) {
 		assert.Error(t, err, "db name %q should be rejected", dbName)
 	}
 
-	toolOptions, err := testutil.GetToolOptions()
+	toolOptions, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	toolOptions.Namespace = &options.Namespace{DB: "test", Collection: "system.foobar"}
 	me, err := New(Options{
@@ -390,7 +394,7 @@ func TestExportNoData(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	log.SetWriter(io.Discard)
 
-	toolOptions, err := testutil.GetToolOptions()
+	toolOptions, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	toolOptions.Namespace = &options.Namespace{DB: "test", Collection: "mongoexport_no_data_test"}
 
@@ -434,7 +438,7 @@ func TestExportPretty(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	toolOptions, err := testutil.GetToolOptions()
+	toolOptions, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	toolOptions.Namespace = &options.Namespace{DB: dbName, Collection: collName}
 	me, err := New(Options{
@@ -482,7 +486,7 @@ func TestExportWritesToStdout(t *testing.T) {
 	require.NoError(t, err)
 
 	args := []string{"go", "run", filepath.Join("..", "mongoexport", "main")}
-	args = append(args, testutil.GetBareArgs()...)
+	args = append(args, testopts.GetBareArgs()...)
 	args = append(args, "--db", dbName, "--collection", collName)
 	cmd := exec.Command(args[0], args[1:]...)
 	stdout, err := cmd.Output()
@@ -571,7 +575,7 @@ func TestExportNestedFieldsCSV(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	toolOptions, err := testutil.GetToolOptions()
+	toolOptions, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	toolOptions.Namespace = &options.Namespace{DB: dbName, Collection: collName}
 
@@ -614,20 +618,9 @@ func TestExportNestedFieldsCSV(t *testing.T) {
 
 func newExportTestClient(t *testing.T, dbName string) *mongo.Client {
 	t.Helper()
-	ssl := testutil.GetSSLOptions()
-	auth := testutil.GetAuthOptions()
-	sessionProvider, err := db.NewSessionProvider(options.ToolOptions{
-		General: &options.General{},
-		SSL:     &ssl,
-		Connection: &options.Connection{
-			Host: "localhost",
-			Port: db.DefaultTestPort,
-		},
-		Auth:         &auth,
-		URI:          &options.URI{},
-		Namespace:    &options.Namespace{},
-		WriteConcern: wcwrapper.Majority(),
-	})
+	toolOptions, err := testopts.GetToolOptions()
+	require.NoError(t, err, "should get tool options")
+	sessionProvider, err := db.NewSessionProvider(*toolOptions)
 	require.NoError(t, err, "should create session provider")
 	client, err := sessionProvider.GetSession()
 	require.NoError(t, err, "should get session")
@@ -639,7 +632,7 @@ func newExportTestClient(t *testing.T, dbName string) *mongo.Client {
 
 func exportWithType(t *testing.T, ns *options.Namespace, typeName string) (string, error) {
 	t.Helper()
-	toolOptions, err := testutil.GetToolOptions()
+	toolOptions, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	toolOptions.Namespace = ns
 	me, err := New(Options{
@@ -708,4 +701,73 @@ func rowsContainValue(rows []map[string]string, col, val string) bool {
 		}
 	}
 	return false
+}
+
+// TestMongoExportMaxEstimatedScanBytes verifies that mongoexport can export a collection larger
+// than the server's maxEstimatedScanBytes threshold (SERVER-127688, added in 9.0). An export with
+// neither a query nor a sort plans an unbounded COLLSCAN, which the server rejects with
+// NoQueryExecutionPlans unless the query carries a $natural hint.
+func TestMongoExportMaxEstimatedScanBytes(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	log.SetWriter(io.Discard)
+
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
+	require.NoError(t, err, "no cluster available")
+	defer sessionProvider.Close()
+
+	serverVersion, err := sessionProvider.ServerVersionArray()
+	require.NoError(t, err, "get server version")
+	if serverVersion.LT(db.Version{9, 0, 0}) {
+		t.Skipf("maxEstimatedScanBytes was added in 9.0; testing with %s", serverVersion.String())
+	}
+
+	// setParameter on a mongos does not reach the shards, so the knob would never be applied to
+	// the nodes that actually plan the query.
+	isMongos, err := sessionProvider.IsMongos()
+	require.NoError(t, err, "check for mongos")
+	if isMongos {
+		t.Skip("setParameter does not propagate from mongos to shards")
+	}
+
+	session, err := sessionProvider.GetSession()
+	require.NoError(t, err, "get session")
+
+	const collName = "max_estimated_scan_bytes"
+	const numDocs = 100
+
+	coll := session.Database(testDB).Collection(collName)
+	require.NoError(t, coll.Drop(context.Background()), "drop existing collection")
+
+	docs := make([]any, numDocs)
+	for i := range docs {
+		docs[i] = bson.D{{"_id", i}, {"pad", strings.Repeat("x", 1024)}}
+	}
+	_, err = coll.InsertMany(context.Background(), docs)
+	require.NoError(t, err, "insert test documents")
+
+	// The collection is ~100KB, so any threshold well below that triggers the rejection.
+	setKnob := func(value any) {
+		var res bson.M
+		err := sessionProvider.Run(
+			bson.D{{"setParameter", 1}, {"maxEstimatedScanBytes", value}},
+			&res,
+			"admin",
+		)
+		require.NoError(t, err, "set maxEstimatedScanBytes to %v", value)
+	}
+	setKnob(int64(1024))
+	defer setKnob(int64(-1))
+
+	opts, err := simpleMongoExportOpts()
+	require.NoError(t, err)
+	opts.Collection = collName
+
+	me, err := New(opts)
+	require.NoError(t, err)
+	defer me.Close()
+
+	out := &bytes.Buffer{}
+	exported, err := me.Export(out)
+	require.NoError(t, err, "export a collection larger than maxEstimatedScanBytes")
+	assert.EqualValues(t, numDocs, exported, "all documents were exported")
 }

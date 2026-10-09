@@ -20,36 +20,6 @@ exec_timeout_secs: 10800
 # run the same task in the previous revision if the current task fails
 stepback: true
 
-variables:
-  # Common mongodb arguments
-  mongod_arguments:
-    default: &mongod_default_startup_args
-      mongod_args: ""
-      mongod_port: 33333
-    ssl: &mongod_ssl_startup_args
-      mongod_args: "--sslMode requireSSL --sslCAFile common/db/testdata/ca-ia.pem --sslPEMKeyFile common/db/testdata/test-server.pem"
-      replsettest_ssl_config: "sslMode: \\\"requireSSL\\\",sslPEMKeyFile: \\\"common/db/testdata/test-server.pem\\\", sslCAFile: \\\"common/db/testdata/ca-ia.pem\\\", sslAllowInvalidHostnames: \\\"\\\""
-      mongod_port: 33333
-    tls: &mongod_tls_startup_args
-      mongod_args_tls: "--tlsMode requireTLS --tlsCAFile common/db/testdata/ca-ia.pem --tlsCertificateKeyFile common/db/testdata/test-server.pem"
-      replsettest_tls_config: "tlsMode: \\\"requireTLS\\\",tlsCertificateKeyFile: \\\"common/db/testdata/test-server.pem\\\", tlsCAFile: \\\"common/db/testdata/ca-ia.pem\\\", tlsAllowInvalidHostnames: \\\"\\\""
-      mongod_port: 33333
-
-  mongo_arguments:
-    default: &mongo_default_startup_args
-      mongo_args: &mongo_default_startup_args_string "--port 33333"
-      mongod_port: 33333
-    ssl: &mongo_ssl_startup_args
-      mongo_args: "--port 33333 --ssl --sslCAFile common/db/testdata/ca-ia.pem --sslPEMKeyFile common/db/testdata/test-server.pem --sslAllowInvalidCertificates"
-      mongod_port: 33333
-    tls: &mongo_tls_startup_args
-      mongo_args_tls: "--port 33333 --tls --tlsCAFile common/db/testdata/ca-ia.pem --tlsCertificateKeyFile common/db/testdata/test-server.pem --tlsAllowInvalidCertificates"
-      mongod_port: 33333
-
-  # Used to determine load_libs_version for *-latest builds.
-  # Same as maxServerVersion supported in download_server.go
-  max_server_version: &max_server_version "8.3"
-
 parameters:
   - key: fake_tag_for_release_testing
     description: |
@@ -59,24 +29,199 @@ parameters:
       parameter's value.
 
 functions:
+  "install mise and go":
+    - command: cache.restore
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/mise.dsc.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+          - src/github.com/mongodb/mongo-tools/scripts/install-mise-and-go.sh
+        name: mise-and-go
+        remote_path: mongo-tools/mise-cache
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        env:
+          EVG_WORKDIR: ${workdir}
+          MISE_AND_GO_CACHE_HIT: ${mise_and_go_cache_hit}
+        script: |
+          set -o errexit
+          set -o pipefail
+          set -o verbose
+
+          ./scripts/install-mise-and-go.sh
+    - command: cache.save
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/mise.dsc.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+          - src/github.com/mongodb/mongo-tools/scripts/install-mise-and-go.sh
+        name: mise-and-go
+        paths:
+          - .local/bin
+          - .local/share/mise
+        remote_path: mongo-tools/mise-cache
+
+  # mise has no builds at all for ppc64le or s390x (see install-go-without-mise.sh), so there's
+  # nothing worth caching on those architectures: we don't touch .local/bin or .local/share/mise
+  # there. In most cases, we expect the Go toolchain version we need to already exist on the
+  # machine. But even in cases where we have to download our own Go toolchain, it's not enough work
+  # to be worth caching.
+  "install go without mise":
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        env:
+          EVG_WORKDIR: ${workdir}
+        script: |
+          set -o errexit
+          set -o pipefail
+          set -o verbose
+
+          ./scripts/install-go-without-mise.sh
+
+  "install mise-managed tools":
+    - command: cache.restore
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+          - ${mise_all_tools_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/mise.dsc.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+          - src/github.com/mongodb/mongo-tools/scripts/install-mise-managed-tools.sh
+          - src/github.com/mongodb/mongo-tools/scripts/recreate-npm-bin-symlinks.py
+        name: mise-all-tools
+        remote_path: mongo-tools/mise-cache
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        env:
+          EVG_WORKDIR: ${workdir}
+          MISE_ALL_TOOLS_CACHE_HIT: ${mise_all_tools_cache_hit}
+        script: |
+          set -o errexit
+          set -o pipefail
+          set -o verbose
+
+          ./scripts/install-mise-managed-tools.sh
+    - command: cache.save
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+          - ${mise_all_tools_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/mise.dsc.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+          - src/github.com/mongodb/mongo-tools/scripts/install-mise-managed-tools.sh
+          - src/github.com/mongodb/mongo-tools/scripts/recreate-npm-bin-symlinks.py
+        name: mise-all-tools
+        paths:
+          - .local/bin
+          - .local/share/mise
+        # We can't use preserve_symlinks here, even though dereferencing breaks the npm tools (see
+        # recreate-npm-bin-symlinks.py). mise's shims are absolute symlinks to the mise binary under
+        # the workdir that saved the cache, and cache.restore rejects absolute symlink targets
+        # outright. Every run gets a different workdir, so those targets can never be valid on
+        # restore anyway. We let the dereferencing happen and repair the npm bin/ links afterwards
+        # in install-mise-managed-tools.sh; the shims come back as plain copies of the mise binary,
+        # which still work, and nothing in CI invokes tools through them regardless.
+        remote_path: mongo-tools/mise-cache
+
+  # node and mongodb-runner are the only mise tools the cluster tasks need, so cache them separately
+  # from "install mise-managed tools" (which installs every tool and is only used by the DSC and
+  # static tasks). The key includes mise.toml, so it is invalidated when either pinned version
+  # changes.
+  "install node and mongodb-runner":
+    - command: cache.restore
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+          - ${mise_mongodb_runner_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+          - src/github.com/mongodb/mongo-tools/scripts/functions.sh
+          - src/github.com/mongodb/mongo-tools/scripts/install-mongodb-runner.sh
+          - src/github.com/mongodb/mongo-tools/scripts/recreate-npm-bin-symlinks.py
+        name: mise-mongodb-runner
+        remote_path: mongo-tools/mise-cache
+    - command: subprocess.exec
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/install-mongodb-runner.sh"
+        env:
+          EVG_WORKDIR: ${workdir}
+          MISE_MONGODB_RUNNER_CACHE_HIT: ${mise_mongodb_runner_cache_hit}
+    - command: cache.save
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+          - ${mise_mongodb_runner_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+          - src/github.com/mongodb/mongo-tools/scripts/functions.sh
+          - src/github.com/mongodb/mongo-tools/scripts/install-mongodb-runner.sh
+          - src/github.com/mongodb/mongo-tools/scripts/recreate-npm-bin-symlinks.py
+        name: mise-mongodb-runner
+        paths:
+          - .local/bin
+          - .local/share/mise
+        remote_path: mongo-tools/mise-cache
+
   "run legacy tests":
-    command: shell.exec
+    command: subprocess.exec
     type: test
     params:
-      shell: bash
+      # binary must be bash (with the script passed via args), not the script
+      # directly: Windows can't execute a shebang script as a native binary.
+      binary: bash
       working_dir: src/github.com/mongodb/mongo-tools
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
-
-        chmod +x bin/*
-        mv bin/* ${test_path}/
-        cd ${test_path}
-        if [ -n "${load_libs_version}" ]; then
-          IMPORT_LOAD_LIBS="await import(\"../shell_common/libs/load_libs-${load_libs_version}.js\");"
-        fi
-        ./mongo --nodb --eval "$IMPORT_LOAD_LIBS" lib/run_mongod.js jstests/tool/*.js
+      args:
+        - "./scripts/run-legacy-tests.sh"
+      env:
+        LOAD_LIBS_VERSION: ${load_libs_version}
+        TEST_PATH: ${test_path}
 
   "run qa-tests":
     command: subprocess.exec
@@ -97,20 +242,165 @@ functions:
       add_expansions_to_env: true
 
   "run make target":
-    command: shell.exec
-    type: test
-    params:
-      shell: bash
-      working_dir: src/github.com/mongodb/mongo-tools
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
+    - command: subprocess.exec
+      type: test
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/run-make-target.sh"
+        env:
+          EVG_BRANCH_NAME: ${branch_name}
+          EVG_BUILD_VARIANT: ${build_variant}
+          EVG_PLATFORM: ${_platform}
+          EVG_WORKDIR: ${workdir}
+          TARGET: ${target}
+          TOOLS_TESTING_AUTH_PASSWORD: ${auth_password}
+          TOOLS_TESTING_AUTH_USERNAME: ${auth_username}
+          TOOLS_TESTING_MONGOD: ${TOOLS_TESTING_MONGOD}
+          TOOLS_TESTING_MONGOD2: ${TOOLS_TESTING_MONGOD2}
+          TOOLS_TESTING_PKCS8_PASSWORD: ${pkcs8_password}
 
-        ${_set_shell_env}
-        ${_maybe_enable_devtoolset_7}
-        PATH=$PATH:$HOME
-        go run build.go -v ${target}
+  #######################################
+  #  Disaggregated Storage (DSC) setup  #
+  #######################################
+  # A DSC cluster needs mongodb-downloader, which is in a private repo and so needs a generated
+  # token. It also needs credentials for two different AWS accounts.
+
+  "start dsc cluster":
+    # The order of these commands is important. ec2.assume_role overwrites existing AWS_*
+    # expansions, so each role has to be used before the next one is assumed. Two roles are needed
+    # because the SLS container images and the Server build live in different accounts. The GitHub
+    # token is generated first because assume_role does not touch it.
+    - command: github.generate_token
+      params:
+        owner: 10gen
+        repo: mongodb-downloader
+        expansion_name: generated_token_mongodb_downloader
+        permissions:
+          attestations: read
+          contents: read
+    - command: ec2.assume_role
+      display_name: Assume IAM role with permissions to pull SLS images from ECR
+      params:
+        role_arn: arn:aws:iam::664315256653:role/disagg-storage-tf-project-ro
+    - command: subprocess.exec
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/authenticate-sls-ecr.sh"
+        env:
+          AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+          AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN}
+    - command: ec2.assume_role
+      display_name: Assume IAM role with permissions to read Server builds from S3
+      params:
+        role_arn: arn:aws:iam::557821124784:role/evergreen.aws-c2c-sync
+    # Share the mongodb-downloader cache with the "download mongod and shell" function.
+    - command: cache.restore
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+          - ${mongodb_downloader_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/mise.dsc.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+        name: mongodb-downloader
+        remote_path: mongo-tools/mise-cache
+    - command: subprocess.exec
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/start-dsc-cluster.sh"
+        env:
+          AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+          AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN}
+          # The cross-cluster task points this at TOOLS_TESTING_MONGOD2 so a separately-started ASC
+          # mongod can own the primary var. Defaults to TOOLS_TESTING_MONGOD in the script.
+          EVG_EXPANSION_VAR: ${EVG_EXPANSION_VAR|TOOLS_TESTING_MONGOD}
+          EVG_WORKDIR: ${workdir}
+          # mise installs mongodb-downloader from a private repo, so it needs a token.
+          GITHUB_TOKEN: ${generated_token_mongodb_downloader}
+    - command: cache.save
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+          - ${mongodb_downloader_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/mise.dsc.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+        name: mongodb-downloader
+        paths:
+          - .local/bin
+          - .local/share/mise
+        remote_path: mongo-tools/mise-cache
+    # The cluster's connection string is only known at runtime, and each command runs in its own
+    # shell, so the script passes this setting through a file rather than an exported variable. This
+    # lets the "run make target" function see TOOLS_TESTING_MONGOD.
+    - command: expansions.update
+      params:
+        file: src/github.com/mongodb/mongo-tools/dsc-cluster/expansions.yml
+
+  # These two tasks run in the project-wide "post" block, so they have to be safe for every
+  # task. Both are no-ops when the task never started a DSC cluster.
+  #
+  # This task is a no-op when the task never started a runner-managed cluster.
+  "stop test cluster":
+    - command: subprocess.exec
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/stop-test-cluster.sh"
+        env:
+          EVG_WORKDIR: ${workdir}
+
+  "stop dsc cluster":
+    - command: subprocess.exec
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/stop-dsc-cluster.sh"
+        env:
+          EVG_WORKDIR: ${workdir}
+
+  "upload dsc cluster logs":
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/github.com/mongodb/mongo-tools/dsc-cluster/logs.tgz
+        remote_file: mongo-tools/dsc-logs/${build_id}/${task_name}/logs.tgz
+        content_type: application/x-gzip
+        bucket: mciuploads
+        permissions: public-read
+        display_name: "DSC cluster logs"
+        optional: true
 
   "download mongod and shell":
     - command: github.generate_token
@@ -120,20 +410,80 @@ functions:
         expansion_name: generated_token_mongo_release
         permissions:
           contents: read
-    - command: shell.exec
+    # mongodb-downloader is private, so mise needs a token to install it. The S3 cache it downloads
+    # from lives in a different account than the CDN, so we assume the c2c role for that too.
+    - command: github.generate_token
       params:
-        shell: bash
+        owner: 10gen
+        repo: mongodb-downloader
+        expansion_name: generated_token_mongodb_downloader
+        permissions:
+          attestations: read
+          contents: read
+    - command: ec2.assume_role
+      display_name: Assume IAM role with permissions to read Server builds from S3
+      params:
+        role_arn: arn:aws:iam::557821124784:role/evergreen.aws-c2c-sync
+    # mongodb-downloader is a private-repo tool, so only these token-bearing functions can install
+    # it. Cache it here so each task does not download and verify the release every run.
+    - command: cache.restore
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+          - ${mongodb_downloader_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/mise.dsc.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+        name: mongodb-downloader
+        remote_path: mongo-tools/mise-cache
+    - command: subprocess.exec
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          ${_set_shell_env}
-          ${_maybe_enable_devtoolset_7}
-          PATH=$PATH:$HOME
-          go run release/release.go download-mongod-and-shell --server-version ${mongo_version}
-        add_expansions_to_env: true
+        args:
+          - "./scripts/download-mongod-and-shell.sh"
+        env:
+          AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+          AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN}
+          EVG_BUILD_ID: ${build_id}
+          EVG_IS_PATCH: ${is_patch}
+          EVG_KEY: ${evg_key}
+          EVG_TRIGGERED_BY_TAG: ${triggered_by_git_tag}
+          EVG_USER: ${evg_user}
+          EVG_VARIANT: ${build_variant}
+          EVG_VERSION: ${version_id}
+          EVG_WORKDIR: ${workdir}
+          FAKE_TAG_FOR_RELEASE_TESTING: ${fake_tag_for_release_testing}
+          GITHUB_TOKEN: ${generated_token_mongodb_downloader}
+          MONGO_VERSION: ${mongo_version}
+          PLATFORM_OVERRIDE: ${_platform}
+          generated_token_mongo_release: ${generated_token_mongo_release}
+    - command: cache.save
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        key_expansions:
+          - ${distro_arch}
+          - ${mise_and_go_cache_version}
+          - ${mongodb_downloader_cache_version}
+        key_files:
+          - src/github.com/mongodb/mongo-tools/mise.toml
+          - src/github.com/mongodb/mongo-tools/mise.dsc.toml
+          - src/github.com/mongodb/mongo-tools/scripts/mise-version.txt
+        name: mongodb-downloader
+        paths:
+          - .local/bin
+          - .local/share/mise
+        remote_path: mongo-tools/mise-cache
 
   "get buildnumber":
     command: keyval.inc
@@ -142,154 +492,83 @@ functions:
       destination: "builder_num"
 
   "setup integration test":
-    command: shell.exec
+    command: subprocess.exec
     params:
-      shell: bash
+      # binary must be bash (with the script passed via args), not the script
+      # directly: Windows can't execute a shebang script as a native binary.
+      binary: bash
       working_dir: src/github.com/mongodb/mongo-tools
       # Set up Kerberos stuff: run kinit if necessary, and add KDC to registry
       # on Windows (see https://wiki.mongodb.com/display/DH/Testing+Kerberos)
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
-
-        # export sensitive info before `set -x`
-        if [ '${run_kinit}' = 'true' ]; then
-            # BUILD-3830
-            mkdir -p "$(pwd)/.evergreen"
-            touch "$(pwd)/.evergreen/krb5.conf.empty"
-            export KRB5_CONFIG="$(pwd)/.evergreen/krb5.conf.empty"
-
-            echo "Writing keytab"
-            echo ${kerberos_keytab} | base64 -d > "$(pwd)/.evergreen/drivers.keytab"
-            echo "Running kinit"
-            kinit -k -t "$(pwd)/.evergreen/drivers.keytab" -p drivers@LDAPTEST.10GEN.CC;
-        fi;
-        set -x
-        set -v
-        if [ "Windows_NT" = "$OS" ]; then
-          cmd /c "REG ADD HKLM\SYSTEM\ControlSet001\Control\Lsa\Kerberos\Domains\LDAPTEST.10GEN.CC /v KdcNames /d ldaptest.10gen.cc /t REG_MULTI_SZ /f"
-        fi;
+      args:
+        - "./scripts/setup-integration-test.sh"
+      env:
+        KERBEROS_KEYTAB: ${kerberos_keytab}
+        RUN_KINIT: ${run_kinit}
 
   "setup credentials":
-    command: shell.exec
+    command: subprocess.exec
     params:
-      shell: bash
+      # binary must be bash (with the script passed via args), not the script
+      # directly: Windows can't execute a shebang script as a native binary.
+      binary: bash
       working_dir: src/github.com/mongodb/mongo-tools
       silent: true
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
+      args:
+        - "./scripts/setup-credentials.sh"
+      env:
+        BUILDER_NUM: ${builder_num}
+        BUILD_VARIANT: ${build_variant}
+        EXECUTION: ${execution}
+        PASSWD: ${passwd}
+        SLAVE: ${slave}
+        TASK_NAME: ${task_name}
 
-        cat > mci.buildlogger <<END_OF_CREDS
-        slavename='${slave}'
-        passwd='${passwd}'
-        builder='MCI_${build_variant}'
-        build_num=${builder_num}
-        build_phase='${task_name}_${execution}'
-        END_OF_CREDS
-        # Resmoke hardcodes the location of this file so we need to copy it to the working directory
-        # we run resmoke from.
-        cp mci.buildlogger test/qa-tests
-
-  "start mongod":
-    command: shell.exec
-    params:
-      shell: bash
-      working_dir: src/github.com/mongodb/mongo-tools
-      background: true
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
-
-        rm -rf mongodb/db_files mongodb/${logfile|run.log}
-        mkdir -p mongodb/db_files
-        MONGOD_ARGS="${mongod_args}"
-        if [ "${USE_TLS}" = "true" ]; then
-          MONGOD_ARGS="${mongod_args_tls}"
-        elif [ "${AWS_AUTH}" = "true" ]; then
-          MONGOD_ARGS="--auth --setParameter authenticationMechanisms=MONGODB-AWS,SCRAM-SHA-256"
-        fi;
-        echo "Starting mongod..."
-        storage_args=''
-        if [ "${STORAGE_ENGINE}" != '' ]; then
-          storage_args='--storageEngine ${STORAGE_ENGINE}'
-        fi
-        PATH=$PWD/bin:$PATH ./bin/mongod${extension}  --port ${mongod_port} $MONGOD_ARGS ${additional_args} --dbpath mongodb/db_files --setParameter=enableTestCommands=1 $storage_args
-
-  "wait for mongod to be ready":
-    command: shell.exec
-    params:
-      shell: bash
-      working_dir: src/github.com/mongodb/mongo-tools
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
-
-        SECS=0
-        MONGO_ARGS="${mongo_args}"
-        if [ "${USE_TLS}" = "true" ]; then
-          MONGO_ARGS="${mongo_args_tls}"
-        elif [ "${AWS_AUTH}" = "true" ]; then
-          MONGO_ARGS="--port 33333"
-        fi;
-        while true ; do
-            set +o errexit
-            ./bin/mongo${extension} $MONGO_ARGS --eval 'true;'
-            status=$?
-            # This overwrites "$?".
-            set -o errexit
-
-            if [ "$status" = "0" ]; then
-                echo "mongod ready";
-                exit 0
-            else
-                SECS=`expr $SECS + 1`
-                if [ $SECS -gt 100 ]; then
-                    echo "mongod not ready after 100 seconds"
-                    exit 1
-                fi
-                echo "waiting for mongod $MONGO_ARGS to be ready..."  ;
-                sleep 1 ;
-            fi
-        done
-
-  "create mongod users":
-    command: shell.exec
-    params:
-      shell: bash
-      working_dir: src/github.com/mongodb/mongo-tools
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
-
-        ${_set_shell_env}
-        MONGO_ARGS="${mongo_args}"
-        if [ "${USE_TLS}" = "true" ]; then
-          MONGO_ARGS="${mongo_args_tls}"
-        fi
-        echo "db.createUser({ user: '${auth_username}', pwd: '${auth_password}', roles: [{ role: '__system', db: 'admin' }] });" | ./bin/mongo${extension} $MONGO_ARGS admin
+  # Setting CREATE_USER starts an auth-enabled server and creates the admin user the tests
+  # authenticate as.
+  "start test cluster":
+    - command: subprocess.exec
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/start-test-cluster.sh"
+        env:
+          AUTH_PASSWORD: ${auth_password}
+          AUTH_USERNAME: ${auth_username}
+          AWS_AUTH: ${AWS_AUTH}
+          CREATE_USER: ${CREATE_USER}
+          EVG_EXPANSION_VAR: TOOLS_TESTING_MONGOD
+          EVG_WORKDIR: ${workdir}
+          SECONDARIES: ${SECONDARIES}
+          SHARDS: ${SHARDS}
+          TOPOLOGY: ${TOPOLOGY|standalone}
+          USE_TLS: ${USE_TLS}
+    - command: expansions.update
+      params:
+        file: src/github.com/mongodb/mongo-tools/test-cluster/tools-test/expansions.yml
 
   "create release artifacts":
     # build release artifacts
-    - command: shell.exec
+    - command: subprocess.exec
       params:
-        shell: bash
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          ${_set_shell_env}
-          ${_maybe_enable_devtoolset_7}
-          PATH=$PATH:$HOME
-          go run release/release.go build-archive
-          go run release/release.go build-packages
+        args:
+          - "./scripts/build-release-archive.sh"
+        env:
+          EVG_BUILD_ID: ${build_id}
+          EVG_IS_PATCH: ${is_patch}
+          EVG_TRIGGERED_BY_TAG: ${triggered_by_git_tag}
+          EVG_VARIANT: ${build_variant}
+          EVG_VERSION: ${version_id}
+          EVG_WORKDIR: ${workdir}
+          FAKE_TAG_FOR_RELEASE_TESTING: ${fake_tag_for_release_testing}
+          PLATFORM_OVERRIDE: ${_platform}
 
     # temporary workaround for TOOLS-2606
     - command: shell.exec
@@ -353,26 +632,29 @@ functions:
         bucket: mciuploads
 
   "sign artifacts":
-    command: shell.exec
-    params:
-      shell: bash
-      working_dir: src/github.com/mongodb/mongo-tools
-      env:
-        MONGO_OS: ${mongo_os}
-        MACOS_NOTARY_KEY: ${MACOS_NOTARY_KEY}
-        MACOS_NOTARY_SECRET: ${MACOS_NOTARY_SECRET}
-        ARTIFACTORY_PASSWORD: ${artifactory_password}
-        ARTIFACTORY_USERNAME: ${artifactory_username}
-        GARASIGN_PASSWORD: ${garasign_password}
-        GARASIGN_USERNAME: ${garasign_username}
-        AUTHENTICODE_KEY_NAME: ${authenticode_key_name}
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
-
-        ${_set_shell_env}
-        ./scripts/sign_artifacts.sh
+    - command: ec2.assume_role
+      display_name: Assume IAM role with permissions to pull from DevProd Platforms ECR
+      params:
+        role_arn: ${devprod_platforms_ecr_readonly_role_arn}
+    - command: subprocess.exec
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/sign_artifacts.sh"
+        env:
+          AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+          AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN}
+          AUTHENTICODE_KEY_NAME: ${authenticode_key_name}
+          EVG_TASK_ID: ${task_id}
+          EVG_TRIGGERED_BY_TAG: ${triggered_by_git_tag}
+          GARASIGN_PASSWORD: ${garasign_password}
+          GARASIGN_USERNAME: ${garasign_username}
+          MACOS_NOTARY_KEY: ${MACOS_NOTARY_KEY}
+          MACOS_NOTARY_SECRET: ${MACOS_NOTARY_SECRET}
 
   "upload signed release artifacts":
     # temporary workaround for TOOLS-2606
@@ -403,30 +685,50 @@ functions:
         content_type: application/octet-stream
 
   "upload release packages to s3":
-    - command: shell.exec
+    - command: subprocess.exec
       params:
-        shell: bash
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          ${_set_shell_env}
-          go run release/release.go upload-release
+        args:
+          - "./scripts/upload-release.sh"
+        env:
+          AWS_ACCESS_KEY_ID: ${cdn_aws_access_key_id}
+          AWS_SECRET_ACCESS_KEY: ${cdn_aws_secret}
+          EVG_BUILD_ID: ${build_id}
+          EVG_IS_PATCH: ${is_patch}
+          EVG_KEY: ${evg_key}
+          EVG_TRIGGERED_BY_TAG: ${triggered_by_git_tag}
+          EVG_USER: ${evg_user}
+          EVG_VARIANT: ${build_variant}
+          EVG_VERSION: ${version_id}
+          EVG_WORKDIR: ${workdir}
+          FAKE_TAG_FOR_RELEASE_TESTING: ${fake_tag_for_release_testing}
+          PLATFORM_OVERRIDE: ${_platform}
 
   "upload release json feed to s3":
-    - command: shell.exec
+    - command: subprocess.exec
       params:
-        shell: bash
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          ${_set_shell_env}
-          go run release/release.go upload-json
+        args:
+          - "./scripts/upload-release-json.sh"
+        env:
+          AWS_ACCESS_KEY_ID: ${cdn_aws_access_key_id}
+          AWS_SECRET_ACCESS_KEY: ${cdn_aws_secret}
+          EVG_BUILD_ID: ${build_id}
+          EVG_IS_PATCH: ${is_patch}
+          EVG_KEY: ${evg_key}
+          EVG_TRIGGERED_BY_TAG: ${triggered_by_git_tag}
+          EVG_USER: ${evg_user}
+          EVG_VARIANT: ${build_variant}
+          EVG_VERSION: ${version_id}
+          EVG_WORKDIR: ${workdir}
+          FAKE_TAG_FOR_RELEASE_TESTING: ${fake_tag_for_release_testing}
+          PLATFORM_OVERRIDE: ${_platform}
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -439,17 +741,23 @@ functions:
         permissions: public-read
 
   "generate full JSON feed":
-    - command: shell.exec
+    - command: subprocess.exec
       params:
-        shell: bash
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          ${_set_shell_env}
-          go run release/release.go generate-full-json
+        args:
+          - "./scripts/generate-full-json-feed.sh"
+        env:
+          EVG_BUILD_ID: ${build_id}
+          EVG_IS_PATCH: ${is_patch}
+          EVG_TRIGGERED_BY_TAG: ${triggered_by_git_tag}
+          EVG_VARIANT: ${build_variant}
+          EVG_VERSION: ${version_id}
+          EVG_WORKDIR: ${workdir}
+          FAKE_TAG_FOR_RELEASE_TESTING: ${fake_tag_for_release_testing}
+          PLATFORM_OVERRIDE: ${_platform}
 
   "upload release packages to linux repos":
     - command: shell.exec
@@ -463,17 +771,27 @@ functions:
 
           curl -L -O http://boxes.10gen.com/build/curator/curator-dist-rhel70-latest.tar.gz
           tar -zxvf curator-dist-rhel70-latest.tar.gz
-    - command: shell.exec
+    - command: subprocess.exec
       params:
-        shell: bash
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          ${_set_shell_env}
-          go run release/release.go linux-release
+        args:
+          - "./scripts/linux-release.sh"
+        env:
+          BARQUE_API_KEY: ${barque_api_key}
+          BARQUE_USERNAME: ${barque_username}
+          EVG_BUILD_ID: ${build_id}
+          EVG_IS_PATCH: ${is_patch}
+          EVG_KEY: ${evg_key}
+          EVG_TRIGGERED_BY_TAG: ${triggered_by_git_tag}
+          EVG_USER: ${evg_user}
+          EVG_VARIANT: ${build_variant}
+          EVG_VERSION: ${version_id}
+          EVG_WORKDIR: ${workdir}
+          FAKE_TAG_FOR_RELEASE_TESTING: ${fake_tag_for_release_testing}
+          PLATFORM_OVERRIDE: ${_platform}
 
   "fetch source":
     - command: shell.exec
@@ -502,224 +820,88 @@ functions:
 
           mkdir -p bin
 
-  "create repl_set":
-    - command: shell.exec
-      params:
-        shell: bash
-        working_dir: src/github.com/mongodb/mongo-tools
-        background: true
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          echo "starting repl set"
-          MONGO_ARGS="${mongo_args}"
-          NODE_OPTIONS=""
-          mkdir -p /data/db/
-          if [ "${USE_TLS}" = "true" ]; then
-            NODE_OPTIONS="${replsettest_tls_config}"
-            MONGO_ARGS="${mongo_args_tls}"
-          elif [ "${USE_SSL}" = "true" ]; then
-            NODE_OPTIONS="${replsettest_ssl_config}"
-          fi
-          # use jsconfig.json to set baseUrl to find libs
-          mv test/shell_common/jsconfig.json ./
-          if [ -n "${load_libs_version}" ]; then
-            IMPORT_LOAD_LIBS="await import(\"../shell_common/libs/load_libs-${load_libs_version}.js\");"
-          fi
-          PATH=./bin:$PATH ./bin/mongo $MONGO_ARGS --nodb --eval "$IMPORT_LOAD_LIBS; TestData = new Object(); TestData.minPort=\"${mongod_port}\"; var repl = new ReplSetTest({nodes:1, name:'repltester', nodeOptions: {$NODE_OPTIONS}});repl.startSet();repl.initiate();repl.awaitSecondaryNodes();while(true){sleep(1000);}"
-
-    - command: shell.exec
-      params:
-        shell: bash
-        working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          MONGO_ARGS="${mongo_args}"
-          if [ "${USE_TLS}" = "true" ]; then
-            MONGO_ARGS="${mongo_args_tls}"
-          fi;
-          ./bin/mongo $MONGO_ARGS --nodb --eval 'assert.soon(function(x){try{var d = new Mongo("localhost:${mongod_port}"); return true} catch(e){return false}}, "timed out connection")'
-
-  "create sharded cluster":
-    - command: shell.exec
-      params:
-        shell: bash
-        working_dir: src/github.com/mongodb/mongo-tools
-        background: true
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          echo "starting sharded cluster"
-          mkdir -p /data/db/
-          # use jsconfig.json to set baseUrl to find libs
-          mv test/shell_common/jsconfig.json ./
-          if [ -n "${load_libs_version}" ]; then
-            IMPORT_LOAD_LIBS="await import(\"../shell_common/libs/load_libs-${load_libs_version}.js\");"
-          fi
-          PATH=./bin:$PATH ./bin/mongo --port ${mongod_port} --nodb --eval "$IMPORT_LOAD_LIBS; var st = new ShardingTest({name: \"tools_sharded_cluster\", shards: 1, mongos: [{port: ${mongod_port}}], other: {rsOptions: {}, configOptions: {}}}); while(true){sleep(1000);}"
-
-    - command: shell.exec
-      params:
-        shell: bash
-        working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          ./bin/mongo --port ${mongod_port} --nodb --eval 'assert.soon(function(x){try{var d = new Mongo("localhost:${mongod_port}"); return true} catch(e){return false}}, "timed out connection")'
-
   "add-aws-auth-variables-to-file":
-    - command: shell.exec
+    - command: subprocess.exec
       type: test
       params:
-        shell: bash
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         silent: true
-        working_dir: src/github.com/mongodb/mongo-tools/common/testdata/lib
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          cat <<EOF > $(pwd)/aws_e2e_setup.json
-          {
-            "iam_auth_assume_aws_account": "${iam_auth_assume_aws_account}",
-            "iam_auth_assume_aws_secret_access_key": "${iam_auth_assume_aws_secret_access_key}",
-            "iam_auth_assume_role_name": "${iam_auth_assume_role_name}"
-          }
-          EOF
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/add-aws-auth-variables-to-file.sh"
+        env:
+          IAM_AUTH_ASSUME_AWS_ACCOUNT: ${iam_auth_assume_aws_account}
+          IAM_AUTH_ASSUME_AWS_SECRET_ACCESS_KEY: ${iam_auth_assume_aws_secret_access_key}
+          IAM_AUTH_ASSUME_ROLE_NAME: ${iam_auth_assume_role_name}
 
   "setup-aws-auth-test-with-assume-role-credentials":
-    - command: shell.exec
+    - command: subprocess.exec
       type: test
       params:
-        shell: bash
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         # silent: true
-        working_dir: src/github.com/mongodb/mongo-tools/common/testdata/lib
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          PATH=/opt/mongodbtoolchain/v3/bin/:$PATH
-          python="python3"
-          if [ "Windows_NT" = "$OS" ]; then
-            python="/cygdrive/c/python/Python311/python"
-          fi
-
-          # The aws_e2e_assume_role script requires python3 with boto3.
-          # Set up or use an existing python virtualenv for boto3.
-          venv='venv'
-          venvNonWindows () { . "$venv"/bin/activate; python -m pip install boto3; }
-          venvWindows () { . "$venv"/Scripts/activate; pip install boto3; }
-
-          if [ -f "$venv"/bin/activate ]; then
-            echo 'activating existing virtualenv'
-            venvNonWindows
-          elif [ -f "$venv"/Scripts/activate ]; then
-            echo 'activating existing virtualenv'
-            dos2unix "$venv"/Scripts/activate
-            venvWindows
-          elif $python -m venv "$venv"; then
-            echo 'creating new virtualenv'
-            if [ -f "$venv"/bin/activate ]; then
-              echo 'activating new virtualenv'
-              venvNonWindows
-            elif [ -f "$venv"/Scripts/activate ]; then
-              echo 'activating new virtualenv'
-              dos2unix "$venv"/Scripts/activate
-              venvWindows
-            fi
-          fi
-
-          $python -m pip list
-
-          ../../../bin/mongo --nodb aws_e2e_assume_role.js
-
-    - command: shell.exec
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/setup-aws-auth-assume-role.sh"
+        env:
+          TOOLS_TESTING_MONGOD: ${TOOLS_TESTING_MONGOD}
+    - command: subprocess.exec
       type: test
       params:
-        shell: bash
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         silent: true
-        working_dir: src/github.com/mongodb/mongo-tools/common/testdata/lib
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
-
-          PATH=/opt/mongodbtoolchain/v3/bin/:$PATH
-          python="python3"
-          if [ "Windows_NT" = "$OS" ]; then
-            python="/cygdrive/c/python/Python311/python"
-          fi
-
-          jsonkey () { $python -c "import sys, json; sys.stdout.write(json.load(sys.stdin)['$1'])" < creds.json; }
-          urlencode () { $python -c "import sys, urllib.parse as ul; sys.stdout.write(ul.quote_plus('$1'))"; }
-
-          USER=$(jsonkey AccessKeyId)
-          USER=$(urlencode $USER)
-
-          PASS=$(jsonkey SecretAccessKey)
-          PASS=$(urlencode $PASS)
-
-          MONGOD_URI="mongodb://$USER:$PASS@localhost:33333/?authMechanism=MONGODB-AWS"
-
-          SESSION_TOKEN=$(jsonkey SessionToken)
-          SESSION_TOKEN=$(urlencode $SESSION_TOKEN)
-          if [ -n $SESSION_TOKEN ]; then
-              MONGOD_URI="$MONGOD_URI&authMechanismProperties=AWS_SESSION_TOKEN:$SESSION_TOKEN"
-          fi
-
-          echo -n "$MONGOD_URI" > MONGOD_URI
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/build-aws-auth-mongod-uri.sh"
+        env:
+          TOOLS_TESTING_MONGOD: ${TOOLS_TESTING_MONGOD}
 
   "check sbom lite":
-    command: shell.exec
-    type: test
-    params:
-      shell: bash
-      working_dir: src/github.com/mongodb/mongo-tools
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
-
-        ${_set_shell_env}
-        ./scripts/regenerate-and-diff-sbom-lite.sh
-
-  "check sarif report":
-    command: shell.exec
-    type: test
-    params:
-      shell: bash
-      working_dir: src/github.com/mongodb/mongo-tools
-      script: |
-        set -o errexit
-        set -o pipefail
-        set -o verbose
-
-        ${_set_shell_env}
-        ./scripts/regenerate-and-diff-sarif-report.sh
-
-  "create evergreen config file":
-    - command: shell.exec
+    - command: subprocess.exec
       type: test
       params:
-        shell: bash
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
         working_dir: src/github.com/mongodb/mongo-tools
-        script: |
-          set -o errexit
-          set -o pipefail
-          set -o verbose
+        args:
+          - "./scripts/regenerate-and-diff-sbom-lite.sh"
+        env:
+          EVG_TASK_ID: ${task_id}
+          EVG_WORKDIR: ${workdir}
 
-          ${_set_shell_env}
-          ./scripts/write-evergreen-config-file.sh
+  "check sarif report":
+    - command: subprocess.exec
+      type: test
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/regenerate-and-diff-sarif-report.sh"
+        env:
+          EVG_WORKDIR: ${workdir}
+
+  "create evergreen config file":
+    - command: subprocess.exec
+      type: test
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        args:
+          - "./scripts/write-evergreen-config-file.sh"
+        env:
+          EVG_KEY: ${evg_key}
+          EVG_USER: ${evg_user}
 
   "set silkbomb credentials":
     - command: ec2.assume_role
@@ -731,8 +913,10 @@ functions:
       params:
         shell: bash
         silent: true
-        include_expansions_in_env:
-          [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN]
+        env:
+          AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+          AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN}
         script: |
           set -o errexit
           set -o pipefail
@@ -747,6 +931,26 @@ functions:
         file: kondukto_token.yml
         redact_file_expansions: true
 
+  "authenticate with devprod platforms ecr":
+    - command: ec2.assume_role
+      display_name: Assume IAM role with permissions to pull from DevProd Platforms ECR
+      params:
+        role_arn: ${devprod_platforms_ecr_readonly_role_arn}
+    - command: subprocess.exec
+      display_name: authenticate with devprod platforms ecr
+      params:
+        # binary must be bash (with the script passed via args), not the script
+        # directly: Windows can't execute a shebang script as a native binary.
+        binary: bash
+        working_dir: src/github.com/mongodb/mongo-tools
+        env:
+          AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+          AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN}
+          EVG_WORKDIR: ${workdir}
+        args:
+          - "./scripts/authenticate-devprod-platforms-ecr.sh"
+
 pre:
   - command: shell.exec
     params:
@@ -759,48 +963,6 @@ pre:
         ${killall_mci|pkill -9 mongo; pkill -9 mongodump; pkill -9 mongoexport; pkill -9 mongoimport; pkill -9 mongofiles; pkill -9 mongorestore; pkill -9 mongostat; pkill -9 mongotop; pkill -9 mongod; pkill -9 mongos; pkill -f buildlogger.py; pkill -f smoke.py} >/dev/null 2>&1
         rm -rf src /data/db/*
         exit 0
-  - command: shell.exec
-    params:
-      shell: bash
-      script: |
-        cat <<EOT > expansions.yml
-        _set_shell_env: |
-          . ./set_goenv.sh
-          GOROOT=""; set_goenv || exit
-          export EVG_IS_PATCH='${is_patch}'
-          export EVG_TRIGGERED_BY_TAG='${triggered_by_git_tag}'
-          if [ -n "${fake_tag_for_release_testing}" ]; then
-            export EVG_TRIGGERED_BY_TAG="${fake_tag_for_release_testing}"
-            export IS_FAKE_TAG=1
-          fi
-          export EVG_BUILD_ID='${build_id}'
-          export EVG_VERSION='${version_id}'
-          export EVG_VARIANT='${build_variant}'
-          if [ '${_platform}' != '' ]; then
-            export EVG_VARIANT='${_platform}'
-          fi
-          export EVG_USER='${evg_user}'
-          export EVG_KEY='${evg_key}'
-          export EVG_TASK_ID='${task_id}'
-          export AWS_ACCESS_KEY_ID='${cdn_aws_access_key_id}'
-          export AWS_SECRET_ACCESS_KEY='${cdn_aws_secret}'
-          export BARQUE_USERNAME='${barque_username}'
-          export BARQUE_API_KEY='${barque_api_key}'
-          export TOOLS_TESTING_AUTH_USERNAME='${auth_username}'
-          export TOOLS_TESTING_AUTH_PASSWORD='${auth_password}'
-          export MONGODB_KERBEROS_PASSWORD='${kerberos_password}'
-          export TOOLS_TESTING_PKCS8_PASSWORD='${pkcs8_password}'
-          set -o xtrace
-          set -o verbose
-          set -o errexit
-        _maybe_enable_devtoolset_7: |
-          if [ -f /opt/rh/devtoolset-7/enable ]; then
-            source /opt/rh/devtoolset-7/enable
-          fi
-        EOT
-  - command: expansions.update
-    params:
-      file: expansions.yml
   # Extra pre steps needed for mongodump passthrough.
   - command: expansions.update
     params:
@@ -813,6 +975,20 @@ pre:
           value: "resmoke-venv"
         - key: mongosync_binary_folder
           value: "mongosync-coverage-binary"
+  # Bump these to force-invalidate the mise Evergreen caches (see the "install mise and go",
+  # "install node and mongodb-runner", "install mise-managed tools", and the mongodb-downloader
+  # caches in the "download mongod and shell" and "start dsc cluster" functions).
+  - command: expansions.update
+    params:
+      updates:
+        - key: mise_and_go_cache_version
+          value: v2
+        - key: mise_all_tools_cache_version
+          value: v3
+        - key: mise_mongodb_runner_cache_version
+          value: v2
+        - key: mongodb_downloader_cache_version
+          value: v1
 
 post:
   # attach.results works for jstests, gotest.parse_files for golang tests
@@ -822,6 +998,9 @@ post:
   - command: gotest.parse_files
     params:
       files: ["src/github.com/mongodb/mongo-tools/testing_output/*.suite"]
+  # Stop the runner-managed cluster before the killall below, so the runner can shut its servers
+  # down cleanly. It is a no-op for tasks that never started one.
+  - func: "stop test cluster"
   - command: shell.exec
     params:
       shell: bash
@@ -842,38 +1021,45 @@ post:
 
         rm -rf /data/db/*
         exit 0
+  - func: "stop dsc cluster"
+  - func: "upload dsc cluster logs"
   # Extra post steps needed for mongodump passthrough.
   - func: f_resmoke_report_attach
   - func: "attach artifacts"
   - func: f_mongo_coredumps_save
 
 timeout:
-  - command: shell.exec
+  - command: subprocess.exec
     params:
-      shell: bash
+      # binary must be bash (with the script passed via args), not the script
+      # directly: Windows can't execute a shebang script as a native binary.
+      binary: bash
       silent: true
-      script: |
-        # This script intentionally doesn't set errexit or pipefail, since these commands can fail and that's ok.
-        set -o verbose
-
-        # don't attempt to abort on any distro which has a special way of
-        # killing everything (i.e. using taskkill on Windows)
-        if [ "${killall_mci}" = "" ]; then
-          all_tools="bsondump mongodump mongoexport mongofiles mongoimport mongorestore mongostat mongotop"
-          # send SIGABRT to print a stacktrace for any hung tool
-          pkill -ABRT "^($(echo -n $all_tools | tr ' ' '|'))\$"
-          # git the processes a second or two to dump their stacks
-          sleep 10
-        fi
+      working_dir: src/github.com/mongodb/mongo-tools
+      args:
+        - "./scripts/timeout-abort-hung-tools.sh"
+      env:
+        KILLALL_MCI: ${killall_mci}
   # Extra timeout steps needed for mongodump passthrough.
   - func: f_expansions_write
   - func: "wait for resmoke to shutdown"
 
 tasks:
+  # A no-op whose dependencies are the tasks that gate a merge. It is the single required GitHub
+  # status check. See the merge-queue buildvariant.
+  - name: merge-queue-workaround
+    commands:
+      - command: shell.exec
+        params:
+          shell: bash
+          script: |
+            echo "This task is a no-op. It exists so that the merge queue has a single required status check."
+
   - name: dist
     tags: ["git_tag"]
     commands:
       - func: "fetch source"
+      - func: "install mise and go"
       - func: "run make target"
         vars:
           target: checkMinVersion
@@ -882,10 +1068,25 @@ tasks:
           target: build
       - func: "create release artifacts"
 
-  # Regardless of the buildvariant, the sign task must be run on a
-  # distro that has the notary client available. We will use
-  # amazon1-2018-test for this purpose. The notary client is not
-  # available on all distros, which is why sign must be a separate task.
+  # Identical to "dist", except it uses "install go without mise" instead of
+  # "install mise and go", since mise has no builds at all for ppc64le or s390x. Used only by the
+  # ppc64le/s390x buildvariants below.
+  - name: dist-without-mise
+    tags: ["git_tag"]
+    commands:
+      - func: "fetch source"
+      - func: "install go without mise"
+      - func: "run make target"
+        vars:
+          target: checkMinVersion
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "create release artifacts"
+
+  # Regardless of the buildvariant, the sign task must be run on a distro that has the notary client
+  # available. We will use rhel87-small for this purpose. The notary client is not available on all
+  # distros, which is why sign must be a separate task.
   - name: sign
     tags: ["git_tag"]
     depends_on:
@@ -893,6 +1094,8 @@ tasks:
     commands:
       - func: "fetch source"
       - func: "fetch dist release artifacts"
+      - func: "authenticate with devprod platforms ecr"
+      - func: "install mise and go"
       - func: "sign artifacts"
       - func: "upload signed release artifacts"
 
@@ -903,6 +1106,7 @@ tasks:
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "upload release packages to s3"
       - func: "upload release packages to linux repos"
       - command: subprocess.exec
@@ -924,24 +1128,30 @@ tasks:
           filenames:
             - "./src/github.com/mongodb/mongo-tools/mongodb-database-tools*"
 
-  - name: check-augmented-sbom
-    tags: ["git_tag"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "set silkbomb credentials"
-      - command: shell.exec
-        params:
-          shell: bash
-          working_dir: src/github.com/mongodb/mongo-tools
-          include_expansions_in_env: [KONDUKTO_TOKEN]
-          script: |
-            set -o errexit
-            set -o pipefail
-            set -o verbose
-
-            ${_set_shell_env}
-            ./scripts/regenerate-and-diff-augmented-sbom.sh
+  # - name: check-augmented-sbom
+  #   tags: ["git_tag"]
+  #   commands:
+  #     - func: "fetch source"
+  #     - command: expansions.update
+  #     - func: "set silkbomb credentials"
+  #     - func: "authenticate with devprod platforms ecr"
+  #     - command: subprocess.exec
+  #       params:
+  #         # binary must be bash (with the script passed via args), not the script
+  #         # directly: Windows can't execute a shebang script as a native binary.
+  #         binary: bash
+  #         working_dir: src/github.com/mongodb/mongo-tools
+  #         args:
+  #           - "./scripts/regenerate-and-diff-augmented-sbom.sh"
+  #         include_expansions_in_env: [KONDUKTO_TOKEN]
+  #         env:
+  #           AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+  #           AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+  #           AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN}
+  #           EVG_TASK_ID: ${task_id}
+  #           EVG_TRIGGERED_BY_TAG: ${triggered_by_git_tag}
+  #           EVG_WORKDIR: ${workdir}
+  #           FAKE_TAG_FOR_RELEASE_TESTING: ${fake_tag_for_release_testing}
 
   - name: release-json
     tags: ["git_tag"]
@@ -951,27 +1161,29 @@ tasks:
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "upload release json feed to s3"
 
   - name: generate-full-json
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "generate full JSON feed"
 
   - name: integration-4.2
-    tags: ["4.2"]
+    tags: ["4.2", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.2"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -981,27 +1193,19 @@ tasks:
           target: test:integration -ssl=true ${testArgs}
 
   - name: integration-4.2-auth
-    tags: ["4.2", "auth"]
+    tags: ["4.2", "auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args"
-              concat: " --auth"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.2"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
+          CREATE_USER: "true"
       - func: "run make target"
         vars:
           target: build
@@ -1010,18 +1214,18 @@ tasks:
           target: test:integration -ssl=true -auth=true ${testArgs}
 
   - name: integration-4.4
-    tags: ["4.4"]
+    tags: ["4.4", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.4"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1031,27 +1235,19 @@ tasks:
           target: test:integration -ssl=true ${testArgs}
 
   - name: integration-4.4-auth
-    tags: ["4.4", "auth"]
+    tags: ["4.4", "auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args_tls"
-              concat: " --auth"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.4"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
+          CREATE_USER: "true"
       - func: "run make target"
         vars:
           target: build
@@ -1060,15 +1256,18 @@ tasks:
           target: test:integration -ssl=true -auth=true ${testArgs}
 
   - name: integration-4.4-cluster
-    tags: ["4.4", "cluster"]
+    tags: ["4.4", "cluster", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.4"
-      - func: "create repl_set"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: replset
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1078,18 +1277,18 @@ tasks:
           target: test:integration -ssl=true -topology=replSet ${testArgs}
 
   - name: integration-5.0
-    tags: ["5.0"]
+    tags: ["5.0", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "5.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1099,27 +1298,19 @@ tasks:
           target: test:integration -ssl=true ${testArgs}
 
   - name: integration-5.0-auth
-    tags: ["5.0", "auth"]
+    tags: ["5.0", "auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args_tls"
-              concat: " --auth"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "5.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
+          CREATE_USER: "true"
       - func: "run make target"
         vars:
           target: build
@@ -1128,15 +1319,18 @@ tasks:
           target: test:integration -ssl=true -auth=true ${testArgs}
 
   - name: integration-5.0-cluster
-    tags: ["5.0", "cluster"]
+    tags: ["5.0", "cluster", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "5.0"
-      - func: "create repl_set"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: replset
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1146,18 +1340,16 @@ tasks:
           target: test:integration -ssl=true -topology=replSet ${testArgs}
 
   - name: aws-auth-5.0
-    tags: ["5.0", "aws-auth"]
+    tags: ["5.0", "aws-auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          edition: "enterprise"
           mongo_version: "5.0"
-      - func: "start mongod"
-        vars:
-          AWS_AUTH: "true"
-      - func: "wait for mongod to be ready"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
           AWS_AUTH: "true"
       - func: "add-aws-auth-variables-to-file"
@@ -1167,18 +1359,18 @@ tasks:
           target: test:awsauth ${testArgs}
 
   - name: integration-6.0
-    tags: ["6.0"]
+    tags: ["6.0", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "6.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1188,27 +1380,19 @@ tasks:
           target: test:integration -ssl=true ${testArgs}
 
   - name: integration-6.0-auth
-    tags: ["6.0", "auth"]
+    tags: ["6.0", "auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args_tls"
-              concat: " --auth"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "6.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
+          CREATE_USER: "true"
       - func: "run make target"
         vars:
           target: build
@@ -1217,15 +1401,18 @@ tasks:
           target: test:integration -ssl=true -auth=true ${testArgs}
 
   - name: integration-6.0-cluster
-    tags: ["6.0", "cluster"]
+    tags: ["6.0", "cluster", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "6.0"
-      - func: "create repl_set"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: replset
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1235,18 +1422,16 @@ tasks:
           target: test:integration -ssl=true -topology=replSet ${testArgs}
 
   - name: aws-auth-6.0
-    tags: ["6.0", "aws-auth"]
+    tags: ["6.0", "aws-auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          edition: "enterprise"
           mongo_version: "6.0"
-      - func: "start mongod"
-        vars:
-          AWS_AUTH: "true"
-      - func: "wait for mongod to be ready"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
           AWS_AUTH: "true"
       - func: "add-aws-auth-variables-to-file"
@@ -1256,18 +1441,18 @@ tasks:
           target: test:awsauth ${testArgs}
 
   - name: integration-7.0
-    tags: ["7.0"]
+    tags: ["7.0", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "7.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1277,27 +1462,19 @@ tasks:
           target: test:integration -ssl=true ${testArgs}
 
   - name: integration-7.0-auth
-    tags: ["7.0", "auth"]
+    tags: ["7.0", "auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args_tls"
-              concat: " --auth"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "7.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
+          CREATE_USER: "true"
       - func: "run make target"
         vars:
           target: build
@@ -1306,15 +1483,18 @@ tasks:
           target: test:integration -ssl=true -auth=true ${testArgs}
 
   - name: integration-7.0-cluster
-    tags: ["7.0", "cluster"]
+    tags: ["7.0", "cluster", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "7.0"
-      - func: "create repl_set"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: replset
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1324,18 +1504,16 @@ tasks:
           target: test:integration -ssl=true -topology=replSet ${testArgs}
 
   - name: aws-auth-7.0
-    tags: ["7.0", "aws-auth"]
+    tags: ["7.0", "aws-auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          edition: "enterprise"
           mongo_version: "7.0"
-      - func: "start mongod"
-        vars:
-          AWS_AUTH: "true"
-      - func: "wait for mongod to be ready"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
           AWS_AUTH: "true"
       - func: "add-aws-auth-variables-to-file"
@@ -1345,18 +1523,18 @@ tasks:
           target: test:awsauth ${testArgs}
 
   - name: integration-8.0
-    tags: ["8.0"]
+    tags: ["8.0", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1366,27 +1544,19 @@ tasks:
           target: test:integration -ssl=true ${testArgs}
 
   - name: integration-8.0-auth
-    tags: ["8.0", "auth"]
+    tags: ["8.0", "auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args_tls"
-              concat: " --auth"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
+          CREATE_USER: "true"
       - func: "run make target"
         vars:
           target: build
@@ -1395,15 +1565,18 @@ tasks:
           target: test:integration -ssl=true -auth=true ${testArgs}
 
   - name: integration-8.0-cluster
-    tags: ["8.0", "cluster"]
+    tags: ["8.0", "cluster", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.0"
-      - func: "create repl_set"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: replset
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1413,108 +1586,16 @@ tasks:
           target: test:integration -ssl=true -topology=replSet ${testArgs}
 
   - name: aws-auth-8.0
-    tags: ["8.0", "aws-auth"]
+    tags: ["8.0", "aws-auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          edition: "enterprise"
           mongo_version: "8.0"
-      - func: "start mongod"
-        vars:
-          AWS_AUTH: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          AWS_AUTH: "true"
-      - func: "add-aws-auth-variables-to-file"
-      - func: "setup-aws-auth-test-with-assume-role-credentials"
-      - func: "run make target"
-        vars:
-          target: test:awsauth ${testArgs}
-
-  - name: integration-8.1
-    tags: ["8.1"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "8.1.0"
-      - func: "start mongod"
-        vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:integration -ssl=true ${testArgs}
-
-  - name: integration-8.1-auth
-    tags: ["8.1", "auth"]
-    commands:
-      - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args_tls"
-              concat: " --auth"
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "8.1.0"
-      - func: "start mongod"
-        vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:integration -ssl=true -auth=true ${testArgs}
-
-  - name: integration-8.1-cluster
-    tags: ["8.1", "cluster"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "8.1.0"
-      - func: "create repl_set"
-        vars:
-          USE_TLS: "true"
-          load_libs_version: "8.1"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:integration -ssl=true -topology=replSet ${testArgs}
-
-  - name: aws-auth-8.1
-    tags: ["8.1", "aws-auth"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          edition: "enterprise"
-          mongo_version: "8.1.0"
-      - func: "start mongod"
-        vars:
-          AWS_AUTH: "true"
-      - func: "wait for mongod to be ready"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
           AWS_AUTH: "true"
       - func: "add-aws-auth-variables-to-file"
@@ -1524,18 +1605,18 @@ tasks:
           target: test:awsauth ${testArgs}
 
   - name: integration-8.2
-    tags: ["8.2"]
+    tags: ["8.2", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.2.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1545,27 +1626,19 @@ tasks:
           target: test:integration -ssl=true ${testArgs}
 
   - name: integration-8.2-auth
-    tags: ["8.2", "auth"]
+    tags: ["8.2", "auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args_tls"
-              concat: " --auth"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.2.0"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
+          CREATE_USER: "true"
       - func: "run make target"
         vars:
           target: build
@@ -1574,17 +1647,19 @@ tasks:
           target: test:integration -ssl=true -auth=true ${testArgs}
 
   - name: integration-8.2-cluster
-    tags: ["8.2", "cluster"]
+    tags: ["8.2", "cluster", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.2.0"
-      - func: "create repl_set"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: replset
           USE_TLS: "true"
-          load_libs_version: "8.2"
       - func: "run make target"
         vars:
           target: build
@@ -1593,18 +1668,16 @@ tasks:
           target: test:integration -ssl=true -topology=replSet ${testArgs}
 
   - name: aws-auth-8.2
-    tags: ["8.2", "aws-auth"]
+    tags: ["8.2", "aws-auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          edition: "enterprise"
           mongo_version: "8.2.0"
-      - func: "start mongod"
-        vars:
-          AWS_AUTH: "true"
-      - func: "wait for mongod to be ready"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
           AWS_AUTH: "true"
       - func: "add-aws-auth-variables-to-file"
@@ -1614,18 +1687,18 @@ tasks:
           target: test:awsauth ${testArgs}
 
   - name: integration-8.3
-    tags: ["8.3"]
+    tags: ["8.3", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.3.0-rc4"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1635,27 +1708,19 @@ tasks:
           target: test:integration -ssl=true ${testArgs}
 
   - name: integration-8.3-auth
-    tags: ["8.3", "auth"]
+    tags: ["8.3", "auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args_tls"
-              concat: " --auth"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.3.0-rc4"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
+          CREATE_USER: "true"
       - func: "run make target"
         vars:
           target: build
@@ -1664,17 +1729,19 @@ tasks:
           target: test:integration -ssl=true -auth=true ${testArgs}
 
   - name: integration-8.3-cluster
-    tags: ["8.3", "cluster"]
+    tags: ["8.3", "cluster", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.3.0-rc4"
-      - func: "create repl_set"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: replset
           USE_TLS: "true"
-          load_libs_version: "8.3"
       - func: "run make target"
         vars:
           target: build
@@ -1683,18 +1750,16 @@ tasks:
           target: test:integration -ssl=true -topology=replSet ${testArgs}
 
   - name: aws-auth-8.3
-    tags: ["8.3", "aws-auth"]
+    tags: ["8.3", "aws-auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          edition: "enterprise"
           mongo_version: "8.3.0-rc4"
-      - func: "start mongod"
-        vars:
-          AWS_AUTH: "true"
-      - func: "wait for mongod to be ready"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
           AWS_AUTH: "true"
       - func: "add-aws-auth-variables-to-file"
@@ -1703,19 +1768,43 @@ tasks:
         vars:
           target: test:awsauth ${testArgs}
 
-  - name: integration-latest
-    tags: ["latest"]
+  # Every other integration task runs with TLS on, which means a test that skips itself when TLS is
+  # enabled never runs anywhere. This task is the one that exercises the no-TLS path. It is
+  # deliberately not tagged with a server version, so that it runs only on the variants that ask for
+  # ".no-ssl".
+  - name: integration-9.0-no-ssl
+    tags: ["no-ssl", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "9.0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: "standalone"
+          USE_TLS: ""
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:integration ${testArgs}
+
+  - name: integration-9.0
+    tags: ["9.0", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          mongo_version: "latest"
-      - func: "start mongod"
+          mongo_version: "9.0.0-rc0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
       - func: "run make target"
         vars:
@@ -1724,28 +1813,20 @@ tasks:
         vars:
           target: test:integration -ssl=true ${testArgs}
 
-  - name: integration-latest-auth
-    tags: ["latest", "auth"]
+  - name: integration-9.0-auth
+    tags: ["9.0", "auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
-      # Concat auth args
-      - command: expansions.update
-        params:
-          updates:
-            - key: "mongod_args_tls"
-              concat: " --auth"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          mongo_version: "latest"
-      - func: "start mongod"
+          mongo_version: "9.0.0-rc0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: "standalone"
           USE_TLS: "true"
-      - func: "wait for mongod to be ready"
-        vars:
-          USE_TLS: "true"
-      - func: "create mongod users"
-        vars:
-          USE_TLS: "true"
+          CREATE_USER: "true"
       - func: "run make target"
         vars:
           target: build
@@ -1753,18 +1834,20 @@ tasks:
         vars:
           target: test:integration -ssl=true -auth=true ${testArgs}
 
-  - name: integration-latest-cluster
-    tags: ["latest", "cluster"]
+  - name: integration-9.0-cluster
+    tags: ["9.0", "cluster", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          mongo_version: "latest"
-      - func: "create repl_set"
+          mongo_version: "9.0.0-rc0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
+          TOPOLOGY: replset
           USE_TLS: "true"
-          load_libs_version: *max_server_version
       - func: "run make target"
         vars:
           target: build
@@ -1772,153 +1855,18 @@ tasks:
         vars:
           target: test:integration -ssl=true -topology=replSet ${testArgs}
 
-  - name: integration-4.4-sharded
-    tags: ["4.4", "sharded"]
+  - name: aws-auth-9.0
+    tags: ["9.0", "aws-auth", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "4.4"
-      - func: "create sharded cluster"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:sharded-integration ${testArgs}
-
-  - name: integration-5.0-sharded
-    tags: ["5.0", "sharded"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "5.0"
-      - func: "create sharded cluster"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:sharded-integration ${testArgs}
-
-  - name: integration-6.0-sharded
-    tags: ["6.0", "sharded"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "6.0"
-      - func: "create sharded cluster"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:sharded-integration ${testArgs}
-
-  - name: integration-7.0-sharded
-    tags: ["7.0", "sharded"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "7.0"
-      - func: "create sharded cluster"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:sharded-integration ${testArgs}
-
-  - name: integration-8.0-sharded
-    tags: ["8.0", "sharded"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "8.0"
-      - func: "create sharded cluster"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:sharded-integration ${testArgs}
-
-  - name: integration-8.1-sharded
-    tags: ["8.1", "sharded"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "8.1.0"
-      - func: "create sharded cluster"
-        vars:
-          load_libs_version: "8.1"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:sharded-integration ${testArgs}
-
-  - name: integration-8.2-sharded
-    tags: ["8.2", "sharded"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "8.2.0"
-      - func: "create sharded cluster"
-        vars:
-          load_libs_version: "8.2"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:sharded-integration ${testArgs}
-
-  - name: integration-latest-sharded
-    tags: ["latest", "sharded"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "latest"
-      - func: "create sharded cluster"
-        vars:
-          load_libs_version: *max_server_version
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run make target"
-        vars:
-          target: test:sharded-integration ${testArgs}
-
-  - name: aws-auth-latest
-    tags: ["latest", "aws-auth"]
-    commands:
-      - func: "fetch source"
-      - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           edition: "enterprise"
-          mongo_version: "latest"
-      - func: "start mongod"
-        vars:
-          AWS_AUTH: "true"
-      - func: "wait for mongod to be ready"
+          mongo_version: "9.0.0-rc0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
           AWS_AUTH: "true"
       - func: "add-aws-auth-variables-to-file"
@@ -1927,19 +1875,245 @@ tasks:
         vars:
           target: test:awsauth ${testArgs}
 
-  - name: aws-auth-4.4
-    tags: ["4.4", "aws-auth"]
+  - name: integration-9.1-dsc
+    commands:
+      - func: "fetch source"
+      - func: "install mise and go"
+      - func: "install mise-managed tools"
+      # Starting the SLS services is slow, so we want to build the tools before starting the
+      # cluster.
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "start dsc cluster"
+      # No -ssl: mongodb-runner starts the replica set without TLS. The connection string reaches
+      # the suite through the TOOLS_TESTING_MONGOD expansion that "start dsc cluster" sets.
+      - func: "run make target"
+        vars:
+          target: test:integration -topology=replSet ${testArgs}
+
+  # Runs the dump/restore and export/import round-trip tests across a plain 9.0 ASC mongod and the
+  # 9.1 DSC cluster, in both directions. The ASC mongod owns the primary connection
+  # (TOOLS_TESTING_MONGOD); the DSC URI goes to TOOLS_TESTING_MONGOD2 so the routed tests exercise
+  # the boundary both ways.
+  - name: integration-9.1-dsc-cross-cluster
+    tags: ["9.1", "dsc", "cross-cluster"]
+    commands:
+      - func: "fetch source"
+      - func: "install mise and go"
+      - func: "install mise-managed tools"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "9.0.0-rc0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: replset
+          USE_TLS: ""
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "start dsc cluster"
+        vars:
+          EVG_EXPANSION_VAR: "TOOLS_TESTING_MONGOD2"
+      - func: "run make target"
+        vars:
+          target: test:cross-cluster ${testArgs}
+
+  - name: integration-4.4-sharded
+    tags: ["4.4", "sharded", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - command: expansions.update
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          edition: "enterprise"
           mongo_version: "4.4"
-      - func: "start mongod"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
-          AWS_AUTH: "true"
-      - func: "wait for mongod to be ready"
+          TOPOLOGY: sharded
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:sharded-integration ${testArgs}
+
+  - name: integration-5.0-sharded
+    tags: ["5.0", "sharded", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "5.0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: sharded
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:sharded-integration ${testArgs}
+
+  - name: integration-6.0-sharded
+    tags: ["6.0", "sharded", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "6.0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: sharded
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:sharded-integration ${testArgs}
+
+  - name: integration-7.0-sharded
+    tags: ["7.0", "sharded", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "7.0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: sharded
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:sharded-integration ${testArgs}
+
+  - name: integration-8.0-sharded
+    tags: ["8.0", "sharded", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: sharded
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:sharded-integration ${testArgs}
+
+  - name: integration-8.2-sharded
+    tags: ["8.2", "sharded", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.2.0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: sharded
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:sharded-integration ${testArgs}
+
+  - name: integration-8.3-sharded
+    tags: ["8.3", "sharded", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "8.3.0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: sharded
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:sharded-integration ${testArgs}
+
+  - name: integration-9.0-sharded
+    tags: ["9.0", "sharded", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "9.0.0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: sharded
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:sharded-integration ${testArgs}
+
+  # Like integration-9.0-sharded, but with TLS, so the sharded suite also covers the TLS path. The
+  # other sharded tasks run without TLS; this is the only sharded task that turns it on.
+  - name: integration-9.0-sharded-tls
+    tags: ["9.0", "sharded", "tls", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "9.0.0"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
+        vars:
+          TOPOLOGY: sharded
+          USE_TLS: "true"
+      - func: "run make target"
+        vars:
+          target: build
+      - func: "run make target"
+        vars:
+          target: test:sharded-integration -ssl=true ${testArgs}
+
+  - name: aws-auth-4.4
+    tags: ["4.4", "aws-auth", "required-for-merge-queue"]
+    commands:
+      - func: "fetch source"
+      - command: expansions.update
+      - func: "install mise and go"
+      - func: "download mongod and shell"
+        vars:
+          mongo_version: "4.4"
+      - func: "install node and mongodb-runner"
+      - func: "start test cluster"
         vars:
           AWS_AUTH: "true"
       - func: "add-aws-auth-variables-to-file"
@@ -1949,7 +2123,7 @@ tasks:
           target: test:awsauth ${testArgs}
 
   - name: kerberos
-    tags: ["kerberos"]
+    tags: ["kerberos", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       # Explicitly run ONLY Kerberos tests
@@ -1959,6 +2133,7 @@ tasks:
             - key: "args"
               value: "${args} -test.types=kerberos"
       - func: "setup integration test"
+      - func: "install mise and go"
       - func: "run make target"
         vars:
           target: build
@@ -1967,11 +2142,12 @@ tasks:
           target: test:kerberos ${testArgs}
 
   - name: legacy-jstests-4.2 # The server jstests from the tools removal from server in 4.2
-    tags: ["4.2"]
+    tags: ["4.2", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.2"
@@ -1983,11 +2159,12 @@ tasks:
           test_path: "test/legacy42"
 
   - name: legacy-jstests-4.4 # The server jstests from the tools removal from server in 4.2
-    tags: ["4.4"]
+    tags: ["4.4", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.4"
@@ -1999,11 +2176,12 @@ tasks:
           test_path: "test/legacy42"
 
   - name: legacy-jstests-5.0 # The server jstests from the tools removal from server in 4.2
-    tags: ["5.0"]
+    tags: ["5.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "5.0"
@@ -2015,11 +2193,12 @@ tasks:
           test_path: "test/legacy42"
 
   - name: legacy-jstests-6.0 # The server jstests from the tools removal from server in 4.2
-    tags: ["6.0"]
+    tags: ["6.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "6.0"
@@ -2031,11 +2210,12 @@ tasks:
           test_path: "test/legacy42"
 
   - name: legacy-jstests-7.0 # The server jstests from the tools removal from server in 4.2
-    tags: ["7.0"]
+    tags: ["7.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "7.0"
@@ -2047,11 +2227,12 @@ tasks:
           test_path: "test/legacy42"
 
   - name: legacy-jstests-8.0 # The server jstests from the tools removal from server in 4.2
-    tags: ["8.0"]
+    tags: ["8.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.0"
@@ -2062,29 +2243,13 @@ tasks:
         vars:
           test_path: "test/legacy42"
 
-  - name: legacy-jstests-8.1 # The server jstests from the tools removal from server in 4.2
-    tags: ["8.1"]
-    commands:
-      - func: "fetch source"
-      - func: "get buildnumber"
-      - func: "setup credentials"
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "8.1.0"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run legacy tests"
-        vars:
-          test_path: "test/legacy42"
-          load_libs_version: "8.1"
-
   - name: legacy-jstests-8.2 # The server jstests from the tools removal from server in 4.2
-    tags: ["8.2"]
+    tags: ["8.2", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.2.0"
@@ -2097,11 +2262,12 @@ tasks:
           load_libs_version: "8.2"
 
   - name: legacy-jstests-8.3 # The server jstests from the tools removal from server in 4.2
-    tags: ["8.3"]
+    tags: ["8.3", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.3.0-rc4"
@@ -2113,63 +2279,57 @@ tasks:
           test_path: "test/legacy42"
           load_libs_version: "8.3"
 
-  - name: legacy-jstests-latest # The server jstests from the tools removal from server in 4.2
-    tags: ["latest"]
+  - name: legacy-jstests-9.0 # The server jstests from the tools removal from server in 4.2
+    tags: ["9.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          mongo_version: "latest"
+          mongo_version: "9.0.0-rc0"
       - func: "run make target"
         vars:
           target: build
       - func: "run legacy tests"
         vars:
           test_path: "test/legacy42"
-          load_libs_version: *max_server_version
+          load_libs_version: "9.0"
 
   - name: mod-tidy
     commands:
       - func: "fetch source"
+      - func: "install mise and go"
       - func: "run make target"
         vars:
           target: sa:modtidy
 
-  - name: evergreen-validate
-    commands:
-      - func: "fetch source"
-      - func: "create evergreen config file"
-      - func: "run make target"
-        vars:
-          target: sa:evgvalidate
-
   - name: lint
     commands:
       - func: "fetch source"
-      - func: "run make target"
-        vars:
-          target: sa:installdevtools
-      - command: shell.exec
+      - func: "install mise and go"
+      - func: "install mise-managed tools"
+      - func: "create evergreen config file"
+      - command: subprocess.exec
         type: test
         params:
-          shell: bash
+          # binary must be bash (with the script passed via args), not the script
+          # directly: Windows can't execute a shebang script as a native binary.
+          binary: bash
           working_dir: src/github.com/mongodb/mongo-tools
-          script: |
-            set -o errexit
-            set -o pipefail
-            set -o verbose
-
-            ${_set_shell_env}
-            ./dev-bin/precious lint --all
+          args:
+            - "./scripts/lint.sh"
+          env:
+            EVG_WORKDIR: ${workdir}
 
   - name: qa-tests-5.0
-    tags: ["5.0"]
+    tags: ["5.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "5.0"
@@ -2182,11 +2342,12 @@ tasks:
           excludes: "requires_unstable,${excludes}"
 
   - name: qa-tests-6.0
-    tags: ["6.0"]
+    tags: ["6.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "6.0"
@@ -2199,11 +2360,12 @@ tasks:
           excludes: "requires_unstable,${excludes}"
 
   - name: qa-tests-7.0
-    tags: ["7.0"]
+    tags: ["7.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "7.0"
@@ -2216,11 +2378,12 @@ tasks:
           excludes: "requires_unstable,${excludes}"
 
   - name: qa-tests-8.0
-    tags: ["8.0"]
+    tags: ["8.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.0"
@@ -2232,29 +2395,13 @@ tasks:
           resmoke_suite: "core${resmoke_use_tls}"
           excludes: "requires_unstable,${excludes}"
 
-  - name: qa-tests-8.1
-    tags: ["8.1"]
-    commands:
-      - func: "fetch source"
-      - func: "get buildnumber"
-      - func: "setup credentials"
-      - func: "download mongod and shell"
-        vars:
-          mongo_version: "8.1.0"
-      - func: "run make target"
-        vars:
-          target: build
-      - func: "run qa-tests"
-        vars:
-          resmoke_suite: "core${resmoke_use_tls}"
-          excludes: "requires_unstable,${excludes}"
-
   - name: qa-tests-8.2
-    tags: ["8.2"]
+    tags: ["8.2", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.2.0"
@@ -2267,11 +2414,12 @@ tasks:
           excludes: "requires_unstable,${excludes}"
 
   - name: qa-tests-8.3
-    tags: ["8.3"]
+    tags: ["8.3", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "8.3.0-rc4"
@@ -2283,15 +2431,16 @@ tasks:
           resmoke_suite: "core${resmoke_use_tls}"
           excludes: "requires_unstable,${excludes}"
 
-  - name: qa-tests-latest
-    tags: ["latest"]
+  - name: qa-tests-9.0
+    tags: ["9.0", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
-          mongo_version: "latest"
+          mongo_version: "9.0.0-rc0"
       - func: "run make target"
         vars:
           target: build
@@ -2301,11 +2450,12 @@ tasks:
           excludes: "requires_unstable,${excludes}"
 
   - name: qa-tests-4.4
-    tags: ["4.4"]
+    tags: ["4.4", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.4"
@@ -2318,11 +2468,12 @@ tasks:
           excludes: "requires_unstable,${excludes}"
 
   - name: qa-tests-4.2
-    tags: ["4.2"]
+    tags: ["4.2", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.2"
@@ -2335,11 +2486,12 @@ tasks:
           excludes: "requires_unstable,${excludes}"
 
   - name: native-cert-ssl-4.4
-    tags: ["4.4"]
+    tags: ["4.4", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.4"
@@ -2349,11 +2501,12 @@ tasks:
       - func: "run native-cert-ssl"
 
   - name: qa-dump-restore-with-archiving-4.4
-    tags: ["4.4"]
+    tags: ["4.4", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.4"
@@ -2366,11 +2519,12 @@ tasks:
           excludes: "requires_unstable,${excludes}"
 
   - name: qa-dump-restore-with-gzip-4.4
-    tags: ["4.4"]
+    tags: ["4.4", "no-race", "required-for-merge-queue"]
     commands:
       - func: "fetch source"
       - func: "get buildnumber"
       - func: "setup credentials"
+      - func: "install mise and go"
       - func: "download mongod and shell"
         vars:
           mongo_version: "4.4"
@@ -2383,9 +2537,11 @@ tasks:
           excludes: "requires_unstable,${excludes}"
 
   - name: unit
+    tags: ["required-for-merge-queue"]
     commands:
       - command: expansions.update
       - func: "fetch source"
+      - func: "install mise and go"
       - func: "run make target"
         vars:
           target: build
@@ -2393,25 +2549,10 @@ tasks:
         vars:
           target: test:unit ${testArgs}
 
-  - name: vet
-    commands:
-      - func: "fetch source"
-      - command: shell.exec
-        type: test
-        params:
-          shell: bash
-          working_dir: src/github.com/mongodb/mongo-tools
-          script: |
-            set -o errexit
-            set -o pipefail
-            set -o verbose
-
-            ${_set_shell_env}
-            go vet -composites=false ./bsondump ./mongo*
-
   - name: check-third-party-notices
     commands:
       - func: "fetch source"
+      - func: "install mise and go"
       - func: "run make target"
         vars:
           target: writeThirdPartyNotices
@@ -2427,17 +2568,26 @@ tasks:
 
             git diff --exit-code
 
+  - name: check-vendored-code
+    commands:
+      - func: "fetch source"
+      - func: "install mise and go"
+      - func: "run make target"
+        vars:
+          target: sa:checkVendoredCode
+
   - name: check-sbom-lite
     commands:
       - func: "fetch source"
+      - func: "authenticate with devprod platforms ecr"
+      - func: "install mise and go"
       - func: "check sbom lite"
 
   - name: check-sarif-report
     commands:
       - func: "fetch source"
-      - func: "run make target"
-        vars:
-          target: sa:installdevtools
+      - func: "install mise and go"
+      - func: "install mise-managed tools"
       - func: "check sarif report"
 
 buildvariants:
@@ -2454,11 +2604,57 @@ buildvariants:
     tasks:
       - name: lint
       - name: mod-tidy
-      - name: evergreen-validate
-      - name: vet
+      - name: check-vendored-code
       - name: check-third-party-notices
       - name: check-sbom-lite
       - name: check-sarif-report
+
+  #######################################
+  #      Merge Queue Buildvariant       #
+  #######################################
+
+  # The one variant GitHub branch protection requires, so that a PR can enter the merge queue as
+  # soon as the tasks below pass rather than waiting for every task the PR runs. The dependencies
+  # are what actually gate a merge. See CONTRIBUTING.md.
+  - name: merge-queue
+    display_name: "! Required for Merge"
+    # This variant exists only to gate a merge, and it must not run on the waterfall. Evergreen
+    # activates a task's dependencies, and the dependencies below include the rhel88 variant, which
+    # is deliberately nightly-only (`cron`). Without this restriction every mainline commit would
+    # pull that whole nightly set in.
+    allowed_requesters: ["github_pr", "github_merge_queue", "patch"]
+    run_on:
+      - rhel80-small
+    tasks:
+      - name: merge-queue-workaround
+    depends_on:
+      - name: "*"
+        variant: static
+      - name: "*"
+        variant: rhel88-race
+      # Every task on this variant that runs tests, which is all of them except dist, push, and
+      # sign.
+      - name: .required-for-merge-queue
+        variant: rhel88
+      - name: integration-9.1-dsc
+        variant: ubuntu2204-arm64-dsc
+      - name: integration-9.1-dsc-cross-cluster
+        variant: ubuntu2204-arm64-dsc
+      # These carry the required-for-merge-queue tag too, but they have to be named individually:
+      # the windows variant runs every server version, while pull request testing only runs the 9.0
+      # tasks on it. Selecting by tag here would gate on tasks a pull request never ran.
+      - name: unit
+        variant: windows
+      - name: integration-9.0
+        variant: windows
+      - name: integration-9.0-auth
+        variant: windows
+      - name: integration-9.0-cluster
+        variant: windows
+      - name: integration-9.0-sharded
+        variant: windows
+      - name: integration-9.0-sharded-tls
+        variant: windows
 
   #######################################
   #     Release Manager Buildvariant    #
@@ -2468,11 +2664,13 @@ buildvariants:
     display_name: "! Release Manager"
     tags: ["git_tag"]
     run_on:
-      - amazon1-2018-test
+      - amazon2023-arm64-latest-small
     tasks:
-      - name: check-augmented-sbom
-        # podman is not available on the amazon distro.
-        run_on: rhel87-small
+      # Temporarily disabled until Kondukto stops regressing the SBOM to an earlier version.
+      #
+      #      - name: check-augmented-sbom
+      #          podman is not available on the amazon distro.
+      #          run_on: rhel87-small
       - name: release-json
       - name: generate-full-json
 
@@ -2480,10 +2678,10 @@ buildvariants:
   #     Amazon x86_64 Buildvariants     #
   #######################################
 
-  - name: amazon
-    display_name: Amazon Linux 64
+  - name: amazon2
+    display_name: Amazon Linux 64 v2
     run_on:
-      - amazon1-2018-test
+      - amazon2-test
     tasks:
       - name: "dist"
       - name: "sign"
@@ -2491,10 +2689,10 @@ buildvariants:
       - name: "push"
         run_on: rhel80-small
 
-  - name: amazon2
-    display_name: Amazon Linux 64 v2
+  - name: amazon2023
+    display_name: Amazon Linux 2023
     run_on:
-      - amazon2-test
+      - amazon2023-small
     tasks:
       - name: "dist"
       - name: "sign"
@@ -2550,14 +2748,23 @@ buildvariants:
       - name: "push"
         run_on: rhel80-small
 
+  - name: debian13
+    display_name: Debian 13
+    run_on:
+      - debian13-small
+    tasks:
+      - name: "dist"
+      - name: "sign"
+        run_on: rhel87-small
+      - name: "push"
+        run_on: rhel80-small
+
   #######################################
   #      macOS x86_64 Buildvariant      #
   #######################################
 
   - name: macos
     display_name: MacOS 14 x86_64
-    expansions:
-      mongo_os: "osx"
     run_on:
       - macos-14
     tasks:
@@ -2572,8 +2779,6 @@ buildvariants:
 
   - name: macos-arm64
     display_name: MacOS 14 ARM
-    expansions:
-      mongo_os: "osx"
     run_on:
       - macos-14-arm64
     tasks:
@@ -2603,17 +2808,7 @@ buildvariants:
     run_on:
       - rhel8.8-large
     expansions:
-      <<:
-        [
-          *mongod_ssl_startup_args,
-          *mongo_ssl_startup_args,
-          *mongod_tls_startup_args,
-          *mongo_tls_startup_args,
-        ]
-      mongo_os: "rhel80"
-      mongo_edition: "enterprise"
       resmoke_use_tls: _tls
-      edition: enterprise
       run_kinit: true
       resmoke_args: --jobs 4
     tasks:
@@ -2624,10 +2819,10 @@ buildvariants:
       - name: ".6.0"
       - name: ".7.0"
       - name: ".8.0"
-      - name: ".8.1"
       - name: ".8.2"
       - name: ".8.3"
-      - name: ".latest"
+      - name: ".9.0"
+      - name: ".no-ssl"
       - name: ".kerberos"
       - name: "dist"
       - name: "sign"
@@ -2640,32 +2835,24 @@ buildvariants:
     run_on:
       - rhel8.8-large
     expansions:
-      <<:
-        [
-          *mongod_ssl_startup_args,
-          *mongo_ssl_startup_args,
-          *mongod_tls_startup_args,
-          *mongo_tls_startup_args,
-        ]
-      mongo_os: "rhel80"
-      mongo_edition: "enterprise"
       testArgs: "-race=true"
       resmoke_use_tls: _tls
-      edition: enterprise
       run_kinit: true
       resmoke_args: --jobs 4
     tasks:
       - name: "unit"
-      - name: ".4.2"
-      - name: ".4.4"
-      - name: ".5.0"
-      - name: ".6.0"
-      - name: ".7.0"
-      - name: ".8.0"
-      - name: ".8.1"
-      - name: ".8.2"
-      - name: ".8.3"
-      - name: ".latest"
+      # The JS tests run via resmoke build the tools with the plain `build` target and run them as
+      # external processes, so they never run with race detection enabled. There's no point in
+      # running them as part of this variant.
+      - name: ".4.2 !.no-race"
+      - name: ".4.4 !.no-race"
+      - name: ".5.0 !.no-race"
+      - name: ".6.0 !.no-race"
+      - name: ".7.0 !.no-race"
+      - name: ".8.0 !.no-race"
+      - name: ".8.2 !.no-race"
+      - name: ".8.3 !.no-race"
+      - name: ".9.0 !.no-race"
       - name: ".kerberos"
 
   - name: rhel93
@@ -2679,10 +2866,10 @@ buildvariants:
       - name: "push"
         run_on: rhel80-small
 
-  - name: amazon2023
-    display_name: Amazon Linux 2023
+  - name: rhel10
+    display_name: RHEL 10
     run_on:
-      - amazon2023-small
+      - rhel10.0-small
     tasks:
       - name: "dist"
       - name: "sign"
@@ -2711,6 +2898,17 @@ buildvariants:
     display_name: SUSE 15
     run_on:
       - suse15sp4-small
+    tasks:
+      - name: "dist"
+      - name: "sign"
+        run_on: rhel87-small
+      - name: "push"
+        run_on: rhel80-small
+
+  - name: suse16
+    display_name: SUSE 16
+    run_on:
+      - suse16-small
     tasks:
       - name: "dist"
       - name: "sign"
@@ -2777,6 +2975,17 @@ buildvariants:
       - name: "push"
         run_on: rhel80-small
 
+  - name: ubuntu2604
+    display_name: Ubuntu 26.04
+    run_on:
+      - ubuntu2604-m6i-xlarge
+    tasks:
+      - name: "dist"
+      - name: "sign"
+        run_on: rhel87-small
+      - name: "push"
+        run_on: rhel80-small
+
   #######################################
   #        Windows Buildvariants        #
   #######################################
@@ -2786,24 +2995,12 @@ buildvariants:
     run_on:
       - windows-2022-latest-large
     expansions:
-      <<:
-        [
-          *mongod_ssl_startup_args,
-          *mongo_ssl_startup_args,
-          *mongod_tls_startup_args,
-          *mongo_tls_startup_args,
-        ]
-      mongo_os: "windows-64"
-      mongo_edition: "enterprise"
       mongo_target: "windows"
       python_binary: "/cygdrive/c/python/Python311/python"
       resmoke_args: --jobs 4
       resmoke_use_tls: _tls
       excludes: requires_large_ram,requires_mongo_24
-      edition: enterprise
-      extension: .exe
       preproc_gpm: "perl -pi -e 's/\\r\\n/\\n/g' "
-      USE_SSL: "true"
     tasks:
       - name: "unit"
       - name: ".4.2"
@@ -2812,10 +3009,9 @@ buildvariants:
       - name: ".6.0"
       - name: ".7.0"
       - name: ".8.0"
-      - name: ".8.1"
       - name: ".8.2"
       - name: ".8.3"
-      - name: ".latest"
+      - name: ".9.0"
       - name: ".kerberos"
       - name: "dist"
       - name: "sign"
@@ -2887,6 +3083,18 @@ buildvariants:
       - name: "push"
         run_on: rhel80-small
 
+  - name: ubuntu2604-arm64
+    display_name: ZAP ARM64 Ubuntu 26.04
+    run_on:
+      - ubuntu2604-arm64-m7g-xlarge
+    stepback: false
+    tasks:
+      - name: "dist"
+      - name: "sign"
+        run_on: rhel87-small
+      - name: "push"
+        run_on: rhel80-small
+
   - name: amazon2-aarch64
     display_name: Amazon Linux ARM v2
     run_on:
@@ -2898,6 +3106,28 @@ buildvariants:
         run_on: rhel87-small
       - name: "push"
         run_on: rhel80-small
+
+  # Disaggregated storage, which the tools have to keep working against. This runs on every PR, via
+  # its own entry in github_pr_aliases, and nightly on the mainline. It needs that explicit alias
+  # because `integrationTestAliases` only matches tasks named like a tag selector (".9.0"), and this
+  # variant lists one literal task name.
+  #
+  # We're using Ubuntu 22.04 arm64 because it has docker-compose v2. The m7g.2xlarge is big enough
+  # to run the many containers for SLS.
+  #
+  # _platform is set because this variant's own name is not in release/platform's table, and
+  # ci-env.sh needs a name that is, or build.go drops the per-platform build tags - including
+  # "failpoints", which several integration tests need.
+  - name: ubuntu2204-arm64-dsc
+    display_name: "# Ubuntu 22.04 ARM Disaggregated Storage"
+    cron: 0 3 * * *
+    run_on:
+      - ubuntu2204-arm64-latest-large
+    expansions:
+      _platform: ubuntu2204-arm64
+    tasks:
+      - name: "integration-9.1-dsc"
+      - name: "integration-9.1-dsc-cross-cluster"
 
   - name: amazon2023-aarch64
     display_name: Amazon Linux 2023 ARM
@@ -2935,6 +3165,18 @@ buildvariants:
       - name: "push"
         run_on: rhel80-small
 
+  - name: rhel10-aarch64
+    display_name: RHEL 10 ARM
+    run_on:
+      - rhel10.0-arm64-small
+    stepback: false
+    tasks:
+      - name: "dist"
+      - name: "sign"
+        run_on: rhel87-small
+      - name: "push"
+        run_on: rhel80-small
+
   #######################################
   #        Power Buildvariants          #
   #######################################
@@ -2945,9 +3187,11 @@ buildvariants:
       - rhel71-power8
     stepback: false
     tasks:
-      - name: "dist"
+      - name: "dist-without-mise"
       - name: "sign"
         run_on: rhel87-small
+        depends_on:
+          - name: dist-without-mise
       - name: "push"
         run_on: rhel80-small
 
@@ -2957,9 +3201,11 @@ buildvariants:
       - rhel81-power8
     stepback: false
     tasks:
-      - name: "dist"
+      - name: "dist-without-mise"
       - name: "sign"
         run_on: rhel87-small
+        depends_on:
+          - name: dist-without-mise
       - name: "push"
         run_on: rhel80-small
 
@@ -2969,9 +3215,25 @@ buildvariants:
       - rhel9-power-small
     stepback: false
     tasks:
-      - name: "dist"
+      - name: "dist-without-mise"
       - name: "sign"
         run_on: rhel87-small
+        depends_on:
+          - name: dist-without-mise
+      - name: "push"
+        run_on: rhel80-small
+
+  - name: rhel10-ppc64le
+    display_name: ZAP PPC64LE RHEL 10
+    run_on:
+      - rhel10-power-small
+    stepback: false
+    tasks:
+      - name: "dist-without-mise"
+      - name: "sign"
+        run_on: rhel87-small
+        depends_on:
+          - name: dist-without-mise
       - name: "push"
         run_on: rhel80-small
 
@@ -2985,9 +3247,11 @@ buildvariants:
       - rhel72-zseries
     stepback: false
     tasks:
-      - name: "dist"
+      - name: "dist-without-mise"
       - name: "sign"
         run_on: rhel87-small
+        depends_on:
+          - name: dist-without-mise
       - name: "push"
         run_on: rhel80-small
 
@@ -2997,9 +3261,11 @@ buildvariants:
       - rhel83-zseries
     stepback: false
     tasks:
-      - name: "dist"
+      - name: "dist-without-mise"
       - name: "sign"
         run_on: rhel87-small
+        depends_on:
+          - name: dist-without-mise
       - name: "push"
         run_on: rhel80-small
 
@@ -3009,11 +3275,35 @@ buildvariants:
       - rhel9-zseries-small
     stepback: false
     tasks:
-      - name: "dist"
+      - name: "dist-without-mise"
       - name: "sign"
         run_on: rhel87-small
+        depends_on:
+          - name: dist-without-mise
       - name: "push"
         run_on: rhel80-small
+
+  - name: rhel10-s390x
+    display_name: ZAP s390x RHEL 10
+    run_on:
+      - rhel10-zseries-small
+    stepback: false
+    tasks:
+      - name: "dist-without-mise"
+      - name: "sign"
+        run_on: rhel87-small
+        depends_on:
+          - name: dist-without-mise
+      - name: "push"
+        run_on: rhel80-small
+
+# Unlike github_pr_aliases, this block is not generated. The merge queue runs the no-op gate task
+# and nothing else, because Evergreen schedules that task's whole dependency closure, and those
+# dependencies are what gate a merge.  Change what gates a merge by editing the merge-queue
+# buildvariant's depends_on, not this block.
+commit_queue_aliases:
+  - variant: "^merge-queue$"
+    task: ".*"
 
 # This set of aliases is generated by the code in the `evergreen` directory.
 # Do not edit this by hand!
@@ -3028,6 +3318,11 @@ github_pr_aliases:
   # Run push and record this PR run in Papertrail.
   - variant: ".*"
     task: "^push$"
+  # Report the merge queue gate on the PR too. Without this the required
+  # status check is never reported on the PR ref and GitHub waits for it
+  # forever.
+  - variant: "^merge-queue$"
+    task: ".*"
   # Run golang tests with the race detector enabled.
   - variant: "^rhel88-race$"
     task: "^(aws-auth|integration|kerberos|unit)"
@@ -3035,7 +3330,10 @@ github_pr_aliases:
   # a relatively recent platform that supports a wide range of servers.
   - variant: "^rhel88$"
     task: "^(aws-auth|integration|kerberos|legacy|native-cert-ssl|qa-dump-restore|qa-tests)"
+  # Run the integration tests against a disaggregated-storage cluster.
+  - variant: "^ubuntu2204-arm64-dsc$"
+    task: ".*"
   # Run a subset of integration tests against the latest version of MongoDB
   # Server on all variants where that is the most recent supported version.
   - variant: "^(rhel88|windows)$"
-    task: "integration-latest"
+    task: "integration-9.0"

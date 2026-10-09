@@ -3,13 +3,16 @@ package dumprestore
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/mongodb/mongo-tools/common/bsonutil"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/mongodb/mongo-tools/common/testutil"
 	"github.com/mongodb/mongo-tools/integration/sharedsuite"
@@ -17,6 +20,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 type DumpRestoreSuite struct {
@@ -29,31 +33,139 @@ func TestDumpRestore(t *testing.T) {
 }
 
 func (s *DumpRestoreSuite) withBSONMongodump(testCase func(string), args ...string) {
+	s.withBSONMongodumpForURI(os.Getenv(testopts.URIEnvVar), testCase, args...)
+}
+
+func (s *DumpRestoreSuite) withBSONMongodumpForURI(
+	uri string,
+	testCase func(string),
+	args ...string,
+) {
 	dir, cleanup := testutil.MakeTempDir(s.T())
 	defer cleanup()
 	dirArgs := []string{
 		"--out", dir,
 	}
-	s.runMongodumpWithArgs(append(dirArgs, args...)...)
+	s.runMongodumpWithArgsForURI(nil, uri, append(dirArgs, args...)...)
 	testCase(dir)
 }
 
 func (s *DumpRestoreSuite) runMongodumpWithArgs(args ...string) {
+	s.runMongodumpWithArgsForURI(nil, os.Getenv(testopts.URIEnvVar), args...)
+}
+
+// runMongodumpToWriter runs mongodump with its standard output redirected to stdout, for the dumps
+// that write their data there rather than to a directory.
+func (s *DumpRestoreSuite) runMongodumpToWriter(stdout io.Writer, uri string, args ...string) {
+	s.runMongodumpWithArgsForURI(stdout, uri, args...)
+}
+
+func (s *DumpRestoreSuite) runMongodumpWithArgsForURI(
+	stdout io.Writer,
+	uri string,
+	args ...string,
+) {
 	cmd := []string{"go", "run", filepath.Join("..", "..", "mongodump", "main")}
-	cmd = append(cmd, testutil.GetBareArgs()...)
+	cmd = append(cmd, testopts.GetBareArgsForURI(uri)...)
 	cmd = append(cmd, args...)
-	out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
 	cmdStr := strings.Join(cmd, " ")
+
+	command := exec.Command(cmd[0], cmd[1:]...)
+
+	var diagnostics strings.Builder
+	command.Stderr = &diagnostics
+	if stdout == nil {
+		command.Stdout = &diagnostics
+	} else {
+		command.Stdout = stdout
+	}
+
+	err := command.Run()
+	out := diagnostics.String()
 	s.Require().NoError(err, "can execute command %s with output: %s", cmdStr, out)
 	s.Require().NotContains(
-		string(out),
+		out,
 		"does not exist",
 		"running [%s] does not tell us the namespace does not exist",
 		cmdStr,
 	)
 
 	// So we can see dump's output when debugging test failures:
-	fmt.Print(string(out))
+	fmt.Print(out)
+}
+
+// concurrentInsertCap bounds the background inserts. mongodump runs as a
+// subprocess that has to be compiled first, so an unbounded loop would insert
+// for as long as that takes and then make the restore pay for all of it.
+const concurrentInsertCap = 10_000
+
+// withConcurrentInserts runs body while a background goroutine inserts documents
+// into coll. body is handed a stopInserts function that ends the inserts, waits
+// for the goroutine to finish and asserts that every insert succeeded; call it at
+// the point where the count of inserted documents needs to stop moving.
+//
+// The inserts also stop when body returns by any path. That matters because an
+// assertion failure inside body ends its goroutine through runtime.Goexit, and
+// inserts left running would then write into the next test's database.
+func (s *DumpRestoreSuite) withConcurrentInserts(
+	coll *mongo.Collection,
+	body func(stopInserts func()),
+) {
+	// Captured here rather than called from the goroutine: s.Context() reads
+	// s.T(), which testify swaps out when it moves to the next test method.
+	ctx := s.Context()
+
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	var inserter sync.WaitGroup
+	var insertErr error
+	var hitCap bool
+
+	endInserts := func() {
+		stopOnce.Do(func() { close(stop) })
+		inserter.Wait()
+	}
+
+	inserter.Go(func() {
+
+		for i := range concurrentInsertCap {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			if _, err := coll.InsertOne(ctx, bson.D{{"_id", concurrentDocID(i)}}); err != nil {
+				insertErr = err
+
+				return
+			}
+		}
+
+		hitCap = true
+	})
+
+	defer endInserts()
+
+	body(func() {
+		endInserts()
+		s.Require().NoError(insertErr, "the background inserts all succeeded")
+		// Callers rely on the inserts still being in flight when they stop them.
+		// Running out first is not a wrong answer to assert against, it means the
+		// setup stopped exercising what the test is about, so say so plainly
+		// rather than letting the test pass on a degenerate run.
+		s.Require().False(
+			hitCap,
+			"the background inserts were still running when the test stopped them; "+
+				"raise concurrentInsertCap",
+		)
+	})
+}
+
+// concurrentDocID gives the background documents _ids of their own rather than
+// letting the server assign ObjectIDs, so that tests can compare sets of _ids.
+func concurrentDocID(i int) string {
+	return fmt.Sprintf("concurrent-%d", i)
 }
 
 func (s *DumpRestoreSuite) createCollectionsWithTestDocuments(
@@ -95,14 +207,21 @@ func (s *DumpRestoreSuite) withBSONMongodumpForCollection(
 	collection string,
 	testCase func(string),
 ) {
+	s.withBSONMongodumpForCollectionForURI(os.Getenv(testopts.URIEnvVar), db, collection, testCase)
+}
+
+func (s *DumpRestoreSuite) withBSONMongodumpForCollectionForURI(
+	uri, db, collection string,
+	testCase func(string),
+) {
 	dir, cleanup := testutil.MakeTempDir(s.T())
 	defer cleanup()
-	s.runBSONMongodumpForCollection(dir, db, collection)
+	s.runBSONMongodumpForCollectionForURI(uri, dir, db, collection)
 	testCase(dir)
 }
 
-func (s *DumpRestoreSuite) runBSONMongodumpForCollection(
-	dir, db, collection string,
+func (s *DumpRestoreSuite) runBSONMongodumpForCollectionForURI(
+	uri, dir, db, collection string,
 	args ...string,
 ) string {
 	baseArgs := []string{
@@ -110,7 +229,9 @@ func (s *DumpRestoreSuite) runBSONMongodumpForCollection(
 		"--db", db,
 		"--collection", collection,
 	}
-	s.runMongodumpWithArgs(
+	s.runMongodumpWithArgsForURI(
+		nil,
+		uri,
 		append(baseArgs, args...)...,
 	)
 	bsonFile := filepath.Join(dir, db, fmt.Sprintf("%s.bson", collection))
@@ -121,16 +242,22 @@ func (s *DumpRestoreSuite) runBSONMongodumpForCollection(
 	return bsonFile
 }
 
-func (s *DumpRestoreSuite) withArchiveMongodump(testCase func(string), dumpArgs ...string) {
+func (s *DumpRestoreSuite) withArchiveMongodumpForURI(
+	uri string,
+	testCase func(string),
+	dumpArgs ...string,
+) {
 	dir, cleanup := testutil.MakeTempDir(s.T())
 	defer cleanup()
 	file := filepath.Join(dir, "archive")
-	s.runArchiveMongodump(file, dumpArgs...)
+	s.runArchiveMongodumpForURI(uri, file, dumpArgs...)
 	testCase(file)
 }
 
-func (s *DumpRestoreSuite) runArchiveMongodump(file string, dumpArgs ...string) {
-	s.runMongodumpWithArgs(
+func (s *DumpRestoreSuite) runArchiveMongodumpForURI(uri, file string, dumpArgs ...string) {
+	s.runMongodumpWithArgsForURI(
+		nil,
+		uri,
 		append(
 			[]string{mongorestore.ArchiveOption + "=" + file},
 			dumpArgs...,
@@ -167,8 +294,12 @@ func (s *DumpRestoreSuite) timeseriesBucketsMayHaveMixedSchemaData(
 	return hasMixedSchema.Boolean()
 }
 
-func (s *DumpRestoreSuite) setupTimeseriesWithMixedSchema(dbName string, collName string) {
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+func (s *DumpRestoreSuite) setupTimeseriesWithMixedSchema(
+	uri string,
+	dbName string,
+	collName string,
+) {
+	sessionProvider, _, err := testutil.GetBareSessionProviderForURI(s.T(), uri)
 	s.Require().NoError(err, "get session provider")
 
 	serverVersion, err := sessionProvider.ServerVersionArray()
@@ -213,4 +344,176 @@ func (s *DumpRestoreSuite) setupTimeseriesWithMixedSchema(dbName string, collNam
 
 	_, err = bucketColl.InsertOne(s.Context(), bucketMap)
 	s.Require().NoError(err, "insert bucket doc")
+}
+
+// database returns a handle to a database named for the test that asked for it.
+// Each test names its own database rather than deriving one from the test name,
+// because the suite's DBName truncates to 63 bytes, which leaves too few
+// distinguishing characters for these deeply nested subtests.
+func (s *DumpRestoreSuite) database(name string) *mongo.Database {
+	session, err := testutil.GetBareSession(s.T())
+	s.Require().NoError(err, "can connect to the server")
+
+	return session.Database("dumprestore_" + name)
+}
+
+// crossCluster is the source/target pair the round-trip tests run between. The wrapper that produces
+// it lives in sharedsuite so the same orientation logic serves dump/restore and export/import.
+type crossCluster = sharedsuite.CrossCluster
+
+func (s *DumpRestoreSuite) createCollection(
+	testDB *mongo.Database,
+	collName string,
+	opts *options.CreateCollectionOptionsBuilder,
+) *mongo.Collection {
+	err := testDB.CreateCollection(s.Context(), collName, opts)
+	s.Require().NoError(err, "can create the collection %#q", collName)
+
+	return testDB.Collection(collName)
+}
+
+// newDumpDir creates a dump directory holding one database directory, for tests
+// that need a dump mongodump would not produce. It returns the dump root and the
+// database directory inside it.
+func (s *DumpRestoreSuite) newDumpDir(dbName string) (string, string) {
+	root := s.T().TempDir()
+	dbDir := filepath.Join(root, dbName)
+	s.Require().NoError(os.MkdirAll(dbDir, 0755), "can create the dump directory")
+
+	return root, dbDir
+}
+
+// writeBSONFile writes documents in the concatenated-BSON format that mongodump
+// produces for a collection.
+func (s *DumpRestoreSuite) writeBSONFile(path string, docs ...bson.D) {
+	var buf []byte
+	for _, doc := range docs {
+		marshaled, err := bson.Marshal(doc)
+		s.Require().NoError(err, "can marshal a document into the bson file")
+		buf = append(buf, marshaled...)
+	}
+
+	s.Require().NoError(os.WriteFile(path, buf, 0644), "can write the bson file %#q", path)
+}
+
+func (s *DumpRestoreSuite) runRestore(args ...string) mongorestore.Result {
+	restore, err := getRestoreWithArgs(args...)
+	s.Require().NoError(err, "can build mongorestore")
+	defer restore.Close()
+
+	return restore.Restore()
+}
+
+// dropDB drops the database and verifies that it is empty, so that a restore
+// which silently does nothing cannot pass by leaving the original data in place.
+func (s *DumpRestoreSuite) dropDB(testDB *mongo.Database) {
+	s.Require().NoError(
+		testDB.Drop(s.Context()),
+		"can drop the database %#q",
+		testDB.Name(),
+	)
+	s.Require().Empty(
+		s.collectionNames(testDB),
+		"dropping %#q removes all of its collections",
+		testDB.Name(),
+	)
+}
+
+func (s *DumpRestoreSuite) dropCollection(coll *mongo.Collection) {
+	s.Require().NoError(coll.Drop(s.Context()), "can drop the collection %#q", coll.Name())
+	s.Require().NotContains(
+		s.collectionNames(coll.Database()),
+		coll.Name(),
+		"dropping %#q removes it",
+		coll.Name(),
+	)
+}
+
+func (s *DumpRestoreSuite) collectionNames(testDB *mongo.Database) []string {
+	names, err := testDB.ListCollectionNames(s.Context(), bson.D{})
+	s.Require().NoError(err, "can list the collections in %#q", testDB.Name())
+
+	return names
+}
+
+func (s *DumpRestoreSuite) docCount(coll *mongo.Collection) int64 {
+	count, err := coll.CountDocuments(s.Context(), bson.D{})
+	s.Require().NoError(err, "can count documents in %#q", coll.Name())
+
+	return count
+}
+
+func (s *DumpRestoreSuite) indexNames(coll *mongo.Collection) []string {
+	specs, err := coll.Indexes().ListSpecifications(s.Context())
+	s.Require().NoError(err, "can list indexes on %#q", coll.Name())
+
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Name)
+	}
+
+	return names
+}
+
+// indexKey returns one index's key document as a bson.D, so that the value
+// types and field order are visible to assertions.
+func (s *DumpRestoreSuite) indexKey(coll *mongo.Collection, indexName string) bson.D {
+	cursor, err := coll.Indexes().List(s.Context())
+	s.Require().NoError(err, "can list indexes on %#q", coll.Name())
+
+	var indexes []struct {
+		Name string `bson:"name"`
+		Key  bson.D `bson:"key"`
+	}
+	s.Require().NoError(cursor.All(s.Context(), &indexes), "can read the index specs")
+
+	for _, index := range indexes {
+		if index.Name == indexName {
+			return index.Key
+		}
+	}
+
+	s.Require().Failf(
+		"index not found",
+		"the index %#q exists on %#q",
+		indexName,
+		coll.Name(),
+	)
+
+	return nil
+}
+
+// collectionOptions returns the collection's creation options, which is where
+// the server reports capped settings, validators, and collations.
+func (s *DumpRestoreSuite) collectionOptions(testDB *mongo.Database, collName string) bson.D {
+	cursor, err := testDB.ListCollections(s.Context(), bson.D{{"name", collName}})
+	s.Require().NoError(err, "can list collections")
+
+	var infos []struct {
+		Options bson.D `bson:"options"`
+	}
+	s.Require().NoError(cursor.All(s.Context(), &infos), "can read the collection info")
+	s.Require().Len(infos, 1, "the collection %#q exists", collName)
+
+	return infos[0].Options
+}
+
+// collectionOption returns one field of a collection's options.
+func (s *DumpRestoreSuite) collectionOption(
+	testDB *mongo.Database,
+	collName string,
+	key string,
+) any {
+	return optionValue(s.collectionOptions(testDB, collName), key)
+}
+
+// optionValue returns one field of an options document, or nil when the server
+// does not report that field at all.
+func optionValue(options bson.D, key string) any {
+	value, err := bsonutil.FindValueByKey(key, &options)
+	if err != nil {
+		return nil
+	}
+
+	return value
 }

@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -29,7 +30,6 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	mopt "go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/xoptions"
-	"golang.org/x/exp/maps"
 )
 
 const insertBufferFactor = 16
@@ -159,8 +159,7 @@ func (restore *MongoRestore) RestoreIndexesForNamespace(namespace *options.Names
 	if len(indexes) > 0 && !restore.OutputOptions.NoIndexRestore {
 		for _, index := range indexes {
 			if addedOpts := index.EnsureIndexVersions(); len(addedOpts) != 0 {
-				optNames := maps.Keys(addedOpts)
-				slices.Sort(optNames)
+				optNames := slices.Sorted(maps.Keys(addedOpts))
 
 				for _, optName := range optNames {
 					log.Logvf(
@@ -176,13 +175,10 @@ func (restore *MongoRestore) RestoreIndexesForNamespace(namespace *options.Names
 		}
 
 		log.Logvf(log.Always, "restoring indexes for collection %#q from metadata", namespaceString)
-		if restore.OutputOptions.ConvertLegacyIndexes {
-			indexes = restore.convertLegacyIndexes(indexes, namespaceString)
-		}
-		if restore.OutputOptions.FixDottedHashedIndexes {
-			fixDottedHashedIndexes(indexes)
-		}
 		for _, index := range indexes {
+			// A v:1 index dumped from a 9.0+ server carries a redundant simple collation that the
+			// server refuses to create alongside v:1; strip it before building the index.
+			stripSimpleCollation(index.Options)
 			log.Logvf(log.Always, "index: %#v", index)
 		}
 		err = restore.CreateIndexes(namespace.DB, namespace.Collection, indexes)
@@ -227,30 +223,38 @@ func (restore *MongoRestore) PopulateMetadataForIntents() error {
 
 	for _, intent := range intents {
 		var metadata *Metadata
-		if intent.MetadataFile == nil {
-			if _, ok := restore.dbCollectionIndexes[intent.DB]; ok {
-				if indexes, ok := restore.dbCollectionIndexes[intent.DB][intent.C]; ok {
-					log.Logvf(log.Always, "no metadata; falling back to system.indexes")
-					for _, indexDefinition := range indexes {
-						restore.indexCatalog.AddIndex(intent.DB, intent.C, indexDefinition)
-					}
-				}
-			}
-		} else {
+		if intent.MetadataFile != nil {
 			err := intent.MetadataFile.Open()
 			if err != nil {
-				return fmt.Errorf("could not open metadata file %v: %v", intent.MetadataLocation, err)
+				return fmt.Errorf(
+					"could not open metadata file %v: %v",
+					intent.MetadataLocation,
+					err,
+				)
 			}
 			defer intent.MetadataFile.Close()
 
-			log.Logvf(log.Always, "reading metadata for %#q from %#q", intent.Namespace(), intent.MetadataLocation)
+			log.Logvf(
+				log.Always,
+				"reading metadata for %#q from %#q",
+				intent.Namespace(),
+				intent.MetadataLocation,
+			)
 			metadataJSON, err := io.ReadAll(intent.MetadataFile)
 			if err != nil {
-				return fmt.Errorf("error reading metadata from %v: %v", intent.MetadataLocation, err)
+				return fmt.Errorf(
+					"error reading metadata from %v: %v",
+					intent.MetadataLocation,
+					err,
+				)
 			}
 			metadata, err = restore.MetadataFromJSON(metadataJSON)
 			if err != nil {
-				return fmt.Errorf("error parsing metadata from %v: %v", intent.MetadataLocation, err)
+				return fmt.Errorf(
+					"error parsing metadata from %v: %v",
+					intent.MetadataLocation,
+					err,
+				)
 			}
 			if metadata != nil {
 				intent.Options = metadata.Options
@@ -268,7 +272,12 @@ func (restore *MongoRestore) PopulateMetadataForIntents() error {
 
 				if restore.OutputOptions.PreserveUUID {
 					if metadata.UUID == "" {
-						log.Logvf(log.Always, "--preserveUUID used but no UUID found in %#q, generating new UUID for %#q", intent.MetadataLocation, intent.Namespace())
+						log.Logvf(
+							log.Always,
+							"--preserveUUID used but no UUID found in %#q, generating new UUID for %#q",
+							intent.MetadataLocation,
+							intent.Namespace(),
+						)
 					}
 					intent.UUID = metadata.UUID
 				}
@@ -382,7 +391,11 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) Result {
 					intent.Namespace(),
 				)
 			} else {
-				log.Logvf(log.Always, "dropping collection %#q before restoring", intent.Namespace())
+				log.Logvf(
+					log.Always,
+					"dropping collection %#q before restoring",
+					intent.Namespace(),
+				)
 				err = restore.DropCollection(intent)
 				if err != nil {
 					return Result{Err: err} // no context needed
@@ -390,7 +403,11 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) Result {
 				collectionExists = false
 			}
 		} else {
-			log.Logvf(log.DebugLow, "collection %#q doesn't exist, skipping drop command", intent.Namespace())
+			log.Logvf(
+				log.DebugLow,
+				"collection %#q doesn't exist, skipping drop command",
+				intent.Namespace(),
+			)
 		}
 	}
 
@@ -420,6 +437,9 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) Result {
 			if !restore.OutputOptions.KeepIndexVersion && !restore.OutputOptions.PreserveUUID {
 				delete(IDIndex.Options, "v")
 			}
+			// A v:1 _id index dumped from a 9.0+ server carries a redundant simple collation
+			// that the server refuses to create alongside v:1; strip it before creating.
+			stripSimpleCollation(IDIndex.Options)
 			IDIndex.Options["ns"] = intent.Namespace()
 
 			// If the collection has an idIndex, then we are about to create it, so
@@ -451,7 +471,11 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) Result {
 		}
 		restore.addToKnownCollections(intent)
 	} else {
-		log.Logvf(log.Info, "collection %#q already exists - skipping collection create", intent.Namespace())
+		log.Logvf(
+			log.Info,
+			"collection %#q already exists - skipping collection create",
+			intent.Namespace(),
+		)
 	}
 
 	var result Result
@@ -484,63 +508,54 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) Result {
 	return result
 }
 
-func (restore *MongoRestore) convertLegacyIndexes(
-	indexes []*idx.IndexDocument,
-	ns string,
-) []*idx.IndexDocument {
-	var indexKeys []bson.D
-	var indexesConverted []*idx.IndexDocument
-	for _, index := range indexes {
-		bsonutil.ConvertLegacyIndexKeys(index.Key, ns)
-
-		foundIdenticalIndex := false
-		for _, keys := range indexKeys {
-			if bsonutil.IsIndexKeysEqual(keys, index.Key) {
-				foundIdenticalIndex = true
-				break
-			}
-		}
-
-		if foundIdenticalIndex {
-			log.Logvf(
-				log.Always,
-				"index %v contains duplicate key with an existing index after ConvertLegacyIndexKeys, Skipping...",
-				index.Options["name"],
-			)
-			continue
-		}
-
-		indexKeys = append(indexKeys, index.Key)
-
-		// It is preferable to use the ignoreUnknownIndexOptions on the createIndex command to
-		// force the server to remove unknown options. But ignoreUnknownIndexOptions was only added in 4.1.9.
-		// So for pre 3.4 indexes being added to servers < 4.1.9 we must strip the options here.
-		if restore.serverVersion.LT(db.Version{4, 1, 9}) {
-			bsonutil.ConvertLegacyIndexOptions(index.Options)
-		}
-		indexesConverted = append(indexesConverted, index)
+// stripSimpleCollation removes a redundant simple collation ({locale: "simple"}) from a v:1 index's
+// options. Starting in MongoDB 9.0, listIndexes reports collation: {locale: "simple"} for indexes
+// created without an explicit collation, whereas older servers omit it entirely. The server rejects
+// creating a v:1 index that carries any collation option ("cannot create an index with the
+// 'collation' option and v=1"), so a v:1 index dumped from a 9.0+ server cannot be restored as-is.
+// Simple collation is the default and semantically equivalent to no collation, so dropping it for
+// v:1 indexes is safe and keeps index round-trips working.
+//
+// This only applies to v:1 indexes: for v>=2, a simple collation may be meaningful (e.g. it is
+// added deliberately so an index does not inherit a non-simple default collection collation) and
+// must be preserved.
+func stripSimpleCollation(options bson.M) {
+	if !indexVersionIsV1(options) {
+		return
 	}
-	return indexesConverted
-}
-
-func fixDottedHashedIndexes(indexes []*idx.IndexDocument) {
-	for _, index := range indexes {
-		fixDottedHashedIndex(index)
+	if collation, ok := options["collation"]; ok && isSimpleCollation(collation) {
+		delete(options, "collation")
 	}
 }
 
-// fixDottedHashedIndex fixes the issue introduced by a server bug where hashed index constraints are not
-// correctly enforced under all circumstance by changing the hashed index on the dotted field to an
-// ascending single field index.
-func fixDottedHashedIndex(index *idx.IndexDocument) {
-	indexFields := index.Key
-	for i, field := range indexFields {
-		fieldName := field.Key
-		if strings.Contains(fieldName, ".") && field.Value == "hashed" {
-			// Change the hashed index to single field index
-			indexFields[i].Value = int32(1)
-		}
+// indexVersionIsV1 reports whether the index's "v" option is 1. The value may be decoded as any of
+// the numeric types depending on the source.
+func indexVersionIsV1(options bson.M) bool {
+	switch v := options["v"].(type) {
+	case int:
+		return v == 1
+	case int32:
+		return v == 1
+	case int64:
+		return v == 1
+	case float64:
+		return v == 1
 	}
+	return false
+}
+
+// isSimpleCollation reports whether the given collation subdocument is the simple collation
+// ({locale: "simple"}). The value may be decoded as either a bson.D or bson.M depending on the
+// source, so both are handled.
+func isSimpleCollation(collation any) bool {
+	switch c := collation.(type) {
+	case bson.D:
+		locale, err := bsonutil.FindValueByKey("locale", &c)
+		return err == nil && locale == "simple"
+	case bson.M:
+		return c["locale"] == "simple"
+	}
+	return false
 }
 
 // RestoreCollectionToDB pipes the given BSON data into the database.
@@ -601,7 +616,7 @@ func (restore *MongoRestore) RestoreCollectionToDB(
 
 	var warnedAboutEmptyTimestamp atomic.Bool
 
-	for i := 0; i < maxInsertWorkers; i++ {
+	for range maxInsertWorkers {
 		go func() {
 			var result Result
 
@@ -697,7 +712,10 @@ func (restore *MongoRestore) RestoreCollectionToDB(
 					return
 				}
 
-				if collModErr := restore.EnableMixedSchemaInTimeseriesBucket(dbName, logicalColName); collModErr != nil {
+				if collModErr := restore.EnableMixedSchemaInTimeseriesBucket(
+					dbName,
+					logicalColName,
+				); collModErr != nil {
 					resultChan <- result.withErr(errors.Wrap(collModErr, "failed to enable mixed schema in a timeseries bucket"))
 					return
 				}
@@ -718,7 +736,7 @@ func (restore *MongoRestore) RestoreCollectionToDB(
 	var finalErr error
 
 	// wait until all insert jobs finish
-	for done := 0; done < maxInsertWorkers; done++ {
+	for range maxInsertWorkers {
 		totalResult.combineWith(<-resultChan)
 		if finalErr == nil && totalResult.Err != nil {
 			finalErr = totalResult.Err

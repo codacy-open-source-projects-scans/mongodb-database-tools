@@ -9,7 +9,9 @@ package mongoimport
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,16 +19,17 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mongodb/mongo-tools/common"
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/options"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/mongodb/mongo-tools/common/testutil"
-	"github.com/mongodb/mongo-tools/common/util"
-	"github.com/mongodb/mongo-tools/common/wcwrapper"
 	. "github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -53,27 +56,11 @@ func checkOnlyHasDocuments(
 		return err
 	}
 
-	collection := session.Database(testDb).Collection(testCollection)
-	cursor, err := collection.Find(
-		t.Context(),
-		bson.D{},
-		mopt.Find().SetSort(bson.D{{"_id", 1}}),
-	)
+	docs, err := findAllDocumentsByID(t, session)
 	if err != nil {
 		return err
 	}
 
-	var docs []bson.M
-	for cursor.Next(t.Context()) {
-		decoder := bson.NewDecoder(bson.NewDocumentReader(bytes.NewReader(cursor.Current)))
-		decoder.DefaultDocumentM()
-		var doc bson.M
-		if err := decoder.Decode(&doc); err != nil {
-			return err
-		}
-
-		docs = append(docs, doc)
-	}
 	if len(docs) != len(expectedDocuments) {
 		return fmt.Errorf("document count mismatch: expected %#v, got %#v",
 			len(expectedDocuments), len(docs))
@@ -87,6 +74,60 @@ func checkOnlyHasDocuments(
 	}
 
 	return nil
+}
+
+// Some imports leave a document whose contents depend on which of several conflicting writes
+// reached the server first, which mongoimport only orders when --maintainInsertionOrder is set.
+// This passes if the collection matches any one of the acceptable outcomes.
+func checkOnlyHasOneOfDocumentSets(
+	t *testing.T,
+	sessionProvider *db.SessionProvider,
+	acceptableDocumentSets [][]bson.M,
+) error {
+	session, err := sessionProvider.GetSession()
+	if err != nil {
+		return err
+	}
+
+	docs, err := findAllDocumentsByID(t, session)
+	if err != nil {
+		return err
+	}
+
+	for _, expectedDocuments := range acceptableDocumentSets {
+		if reflect.DeepEqual(docs, expectedDocuments) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("document mismatch: expected any of %#v, got %#v",
+		acceptableDocumentSets, docs)
+}
+
+func findAllDocumentsByID(t *testing.T, session *mongo.Client) ([]bson.M, error) {
+	collection := session.Database(testDb).Collection(testCollection)
+	cursor, err := collection.Find(
+		t.Context(),
+		bson.D{},
+		mopt.Find().SetSort(bson.D{{"_id", 1}}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var docs []bson.M
+	for cursor.Next(t.Context()) {
+		decoder := bson.NewDecoder(bson.NewDocumentReader(bytes.NewReader(cursor.Current)))
+		decoder.DefaultDocumentM()
+		var doc bson.M
+		if err := decoder.Decode(&doc); err != nil {
+			return nil, err
+		}
+
+		docs = append(docs, doc)
+	}
+
+	return docs, cursor.Err()
 }
 
 func countDocuments(t *testing.T, sessionProvider *db.SessionProvider) (int, error) {
@@ -107,27 +148,14 @@ func countDocuments(t *testing.T, sessionProvider *db.SessionProvider) (int, err
 // getBasicToolOptions returns a test helper to instantiate the session provider
 // for calls to StreamDocument.
 func getBasicToolOptions() *options.ToolOptions {
-	general := &options.General{}
-	ssl := testutil.GetSSLOptions()
-	auth := testutil.GetAuthOptions()
-	namespace := &options.Namespace{
-		DB:         testDb,
-		Collection: testCollection,
+	toolOptions, err := testopts.GetToolOptions()
+	if err != nil {
+		panic(fmt.Sprintf("could not get tool options: %v", err))
 	}
-	connection := &options.Connection{
-		Host: "localhost",
-		Port: db.DefaultTestPort,
-	}
+	toolOptions.Namespace.DB = testDb
+	toolOptions.Namespace.Collection = testCollection
 
-	return &options.ToolOptions{
-		General:      general,
-		SSL:          &ssl,
-		Namespace:    namespace,
-		Connection:   connection,
-		Auth:         &auth,
-		URI:          &options.URI{},
-		WriteConcern: wcwrapper.Majority(),
-	}
+	return toolOptions
 }
 
 func newOptions() Options {
@@ -140,8 +168,20 @@ func newOptions() Options {
 	}
 }
 
-func NewMongoImport() (*MongoImport, error) {
-	return New(newOptions())
+// An unclosed session provider leaves the driver's topology-monitoring
+// goroutines running for the remainder of the test binary's run, so the
+// returned MongoImport is closed when the test ends and must not be used after
+// that.
+func NewMongoImport(t *testing.T) (*MongoImport, error) {
+	t.Helper()
+
+	imp, err := New(newOptions())
+	if err != nil {
+		return nil, err
+	}
+	t.Cleanup(imp.Close)
+
+	return imp, nil
 }
 
 // NewMockMongoImport gets an instance of MongoImport with no underlying SessionProvider.
@@ -161,8 +201,12 @@ func NewMockMongoImport() *MongoImport {
 	}
 }
 
-func getImportWithArgs(additionalArgs ...string) (*MongoImport, error) {
-	opts, err := ParseOptions(append(testutil.GetBareArgs(), additionalArgs...), "", "")
+// The returned MongoImport is closed when the test ends, for the same reason as
+// NewMongoImport, and must not be used after that.
+func getImportWithArgs(t *testing.T, additionalArgs ...string) (*MongoImport, error) {
+	t.Helper()
+
+	opts, err := ParseOptions(append(testopts.GetBareArgs(), additionalArgs...), "", "")
 	if err != nil {
 		return nil, fmt.Errorf("error parsing args: %v", err)
 	}
@@ -178,6 +222,7 @@ func getImportWithArgs(additionalArgs ...string) (*MongoImport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error making new instance of mongorestore: %v", err)
 	}
+	t.Cleanup(imp.Close)
 
 	return imp, nil
 }
@@ -597,7 +642,7 @@ func TestImportDocuments(t *testing.T) {
 		})
 		Convey("no error should be thrown for CSV import on test data and all "+
 			"CSV data lines should be imported correctly", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -612,7 +657,7 @@ func TestImportDocuments(t *testing.T) {
 		})
 		Convey("an error should be thrown for JSON import on test data that is "+
 			"JSON array", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.File = "testdata/test_array.json"
@@ -623,7 +668,7 @@ func TestImportDocuments(t *testing.T) {
 		})
 		Convey("TOOLS-247: no error should be thrown for JSON import on test "+
 			"data and all documents should be imported correctly", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.File = "testdata/test_plain2.json"
@@ -634,7 +679,7 @@ func TestImportDocuments(t *testing.T) {
 			So(numFailed, ShouldEqual, 0)
 		})
 		Convey("CSV import with --ignoreBlanks should import only non-blank fields", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -655,7 +700,7 @@ func TestImportDocuments(t *testing.T) {
 			So(checkOnlyHasDocuments(t, imp.SessionProvider, expectedDocuments), ShouldBeNil)
 		})
 		Convey("CSV import without --ignoreBlanks should include blanks", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -674,7 +719,7 @@ func TestImportDocuments(t *testing.T) {
 			So(checkOnlyHasDocuments(t, imp.SessionProvider, expectedDocuments), ShouldBeNil)
 		})
 		Convey("no error should be thrown for CSV import on test data with --upsertFields", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -696,7 +741,7 @@ func TestImportDocuments(t *testing.T) {
 		})
 		Convey("no error should be thrown for CSV import on test data with "+
 			"--stopOnError. Only documents before error should be imported", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -720,7 +765,7 @@ func TestImportDocuments(t *testing.T) {
 		Convey(
 			"CSV import with duplicate _id's should not error if --stopOnError is not set",
 			func() {
-				imp, err := NewMongoImport()
+				imp, err := NewMongoImport(t)
 				So(err, ShouldBeNil)
 				imp.IngestOptions.Mode = modeInsert
 				imp.InputOptions.Type = CSV
@@ -733,18 +778,27 @@ func TestImportDocuments(t *testing.T) {
 				So(numProcessed, ShouldEqual, 4)
 				So(numFailed, ShouldEqual, 1)
 
-				expectedDocuments := []bson.M{
-					{"_id": int32(1), "b": int32(2), "c": int32(3)},
-					{"_id": int32(3), "b": 5.4, "c": "string"},
-					{"_id": int32(5), "b": int32(6), "c": int32(6)},
-					{"_id": int32(8), "b": int32(6), "c": int32(6)},
+				// All docs except the one with a duplicate _id should be imported. This import is
+				// unordered (--maintainInsertionOrder is unset), which is what lets it continue
+				// past the duplicate key error, so whichever _id:5 row loses the race is the one
+				// that errors out and either may be the survivor.
+				var acceptableDocumentSets [][]bson.M
+				for _, cOfDuplicate := range []int32{6, 9} {
+					acceptableDocumentSets = append(acceptableDocumentSets, []bson.M{
+						{"_id": int32(1), "b": int32(2), "c": int32(3)},
+						{"_id": int32(3), "b": 5.4, "c": "string"},
+						{"_id": int32(5), "b": int32(6), "c": cOfDuplicate},
+						{"_id": int32(8), "b": int32(6), "c": int32(6)},
+					})
 				}
-				// all docs except the one with duplicate _id - should be imported
-				So(checkOnlyHasDocuments(t, imp.SessionProvider, expectedDocuments), ShouldBeNil)
+				So(
+					checkOnlyHasOneOfDocumentSets(t, imp.SessionProvider, acceptableDocumentSets),
+					ShouldBeNil,
+				)
 			},
 		)
 		Convey("no error should be thrown for CSV import on test data with --drop", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -766,7 +820,7 @@ func TestImportDocuments(t *testing.T) {
 			So(checkOnlyHasDocuments(t, imp.SessionProvider, expectedDocuments), ShouldBeNil)
 		})
 		Convey("CSV import on test data with --headerLine should succeed", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -784,7 +838,7 @@ func TestImportDocuments(t *testing.T) {
 			So(err, ShouldBeNil)
 			csvFile.Close()
 
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -798,7 +852,7 @@ func TestImportDocuments(t *testing.T) {
 			So(numFailed, ShouldEqual, 0)
 		})
 		Convey("CSV import with --mode=upsert and --upsertFields should succeed", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -820,7 +874,7 @@ func TestImportDocuments(t *testing.T) {
 		})
 		Convey("CSV import with --mode=delete should succeed", func() {
 			// First import 3 documents
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -834,7 +888,7 @@ func TestImportDocuments(t *testing.T) {
 			So(numFailed, ShouldEqual, 0)
 
 			// Then delete two documents
-			imp, err = NewMongoImport()
+			imp, err = NewMongoImport(t)
 			So(err, ShouldBeNil)
 
 			imp.InputOptions.Type = CSV
@@ -857,7 +911,7 @@ func TestImportDocuments(t *testing.T) {
 		})
 		Convey("CSV import with --mode=delete and --upsertFields should succeed", func() {
 			// First import 3 documents
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -871,7 +925,7 @@ func TestImportDocuments(t *testing.T) {
 			So(numFailed, ShouldEqual, 0)
 
 			// Then delete two documents
-			imp, err = NewMongoImport()
+			imp, err = NewMongoImport(t)
 			So(err, ShouldBeNil)
 
 			imp.InputOptions.Type = CSV
@@ -896,7 +950,7 @@ func TestImportDocuments(t *testing.T) {
 		Convey("CSV import with --mode=delete and --ignoreBlanks should not take any action for "+
 			"documents that have blank values for upsert fields", func() {
 			// First import 3 documents
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -910,7 +964,7 @@ func TestImportDocuments(t *testing.T) {
 			So(numFailed, ShouldEqual, 0)
 
 			// Then delete two documents
-			imp, err = NewMongoImport()
+			imp, err = NewMongoImport(t)
 			So(err, ShouldBeNil)
 
 			imp.InputOptions.Type = CSV
@@ -935,7 +989,7 @@ func TestImportDocuments(t *testing.T) {
 		})
 		Convey("CSV import with --mode=upsert/--upsertFields with duplicate id should succeed "+
 			"even if stopOnError is set", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.InputOptions.Type = CSV
 			imp.InputOptions.File = "testdata/test_duplicate.csv"
@@ -944,6 +998,10 @@ func TestImportDocuments(t *testing.T) {
 			imp.IngestOptions.Mode = modeUpsert
 			imp.IngestOptions.StopOnError = true
 			imp.upsertFields = []string{"_id"}
+			// The file upserts _id:5 twice and this asserts the later row wins, which is only
+			// guaranteed when the writes are ordered. No document errors here, so ordering them
+			// does not change what this test covers.
+			imp.IngestOptions.MaintainInsertionOrder = true
 			numProcessed, numFailed, err := imp.ImportDocuments()
 			So(err, ShouldBeNil)
 			So(numProcessed, ShouldEqual, 5)
@@ -958,7 +1016,7 @@ func TestImportDocuments(t *testing.T) {
 		})
 		Convey("an error should be thrown for CSV import on test data with "+
 			"duplicate _id if --stopOnError is set", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -981,7 +1039,7 @@ func TestImportDocuments(t *testing.T) {
 		})
 		Convey("an error should be thrown for JSON import on test data that "+
 			"is a JSON array without passing --jsonArray", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.File = "testdata/test_array.json"
@@ -998,7 +1056,7 @@ func TestImportDocuments(t *testing.T) {
 			So(jsonInputReader.StreamDocument(t.Context(), true, docChan), ShouldNotBeNil)
 		})
 		Convey("an error should be thrown for invalid CSV import on test data", func() {
-			imp, err := NewMongoImport()
+			imp, err := NewMongoImport(t)
 			So(err, ShouldBeNil)
 			imp.IngestOptions.Mode = modeInsert
 			imp.InputOptions.Type = CSV
@@ -1015,7 +1073,7 @@ func TestImportDocuments(t *testing.T) {
 		Convey(
 			"CSV import with --mode=upsert/--upsertFields with a nested upsert field should succeed when repeated",
 			func() {
-				imp, err := NewMongoImport()
+				imp, err := NewMongoImport(t)
 				So(err, ShouldBeNil)
 				imp.InputOptions.Type = CSV
 				imp.InputOptions.File = "testdata/test_nested_upsert.csv"
@@ -1031,7 +1089,7 @@ func TestImportDocuments(t *testing.T) {
 				So(n, ShouldEqual, 1)
 
 				// Repeat must succeed
-				imp, err = NewMongoImport()
+				imp, err = NewMongoImport(t)
 				So(err, ShouldBeNil)
 				imp.InputOptions.Type = CSV
 				imp.InputOptions.File = "testdata/test_nested_upsert.csv"
@@ -1372,14 +1430,14 @@ func nestedFieldsTestHelper(
 	expectedErr error,
 ) func() {
 	return func() {
-		err := os.WriteFile(util.ToUniversalPath("./temp_test_data.csv"), []byte(data), 0644)
+		err := os.WriteFile(filepath.FromSlash("./temp_test_data.csv"), []byte(data), 0644)
 		So(err, ShouldBeNil)
 		defer func() {
-			err = os.Remove(util.ToUniversalPath("./temp_test_data.csv"))
+			err = os.Remove(filepath.FromSlash("./temp_test_data.csv"))
 			So(err, ShouldBeNil)
 		}()
 
-		imp, err := NewMongoImport()
+		imp, err := NewMongoImport(t)
 		So(err, ShouldBeNil)
 
 		imp.InputOptions.Type = CSV
@@ -1469,7 +1527,7 @@ func TestImportMIOSOE(t *testing.T) {
 		t.Fatalf("Could not generate test data: %v", err)
 	}
 
-	client, err := testutil.GetBareSession()
+	client, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available?? (%v)", err)
 	}
@@ -1477,7 +1535,7 @@ func TestImportMIOSOE(t *testing.T) {
 	coll := database.Collection("mio")
 
 	Convey("default restore ignores dup key errors", t, func() {
-		imp, err := getImportWithArgs(mioSoeFile,
+		imp, err := getImportWithArgs(t, mioSoeFile,
 			"--collection", coll.Name(),
 			"--db", database.Name(),
 			"--drop")
@@ -1496,7 +1554,7 @@ func TestImportMIOSOE(t *testing.T) {
 	})
 
 	Convey("--maintainInsertionOrder stops exactly on dup key errors", t, func() {
-		imp, err := getImportWithArgs(mioSoeFile,
+		imp, err := getImportWithArgs(t, mioSoeFile,
 			"--collection", coll.Name(),
 			"--db", database.Name(),
 			"--drop",
@@ -1518,7 +1576,7 @@ func TestImportMIOSOE(t *testing.T) {
 	})
 
 	Convey("--stopOnError stops on dup key errors", t, func() {
-		imp, err := getImportWithArgs(mioSoeFile,
+		imp, err := getImportWithArgs(t, mioSoeFile,
 			"--collection", coll.Name(),
 			"--db", database.Name(),
 			"--drop",
@@ -1580,7 +1638,7 @@ func TestImportBooleanType(t *testing.T) {
 	}
 	require.NoError(t, tmpFile.Close())
 
-	importToolOptions, err := testutil.GetToolOptions()
+	importToolOptions, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	importToolOptions.Namespace = &options.Namespace{DB: dbName, Collection: collName}
 	mi, err := New(Options{
@@ -1614,7 +1672,9 @@ func TestImportCollectionNameDerivation(t *testing.T) {
 
 	client := newImportTestClient(t, dbName)
 	t.Cleanup(func() {
-		_ = client.Database("testdb2").Drop(t.Context())
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		require.NoError(t, client.Database("testdb2").Drop(ctx))
 	})
 
 	tmpDir := t.TempDir()
@@ -1686,7 +1746,7 @@ func TestImportExtraFields(t *testing.T) {
 	fieldNames := []string{"a", "b", "c.xyz", "d.hij.lkm"}
 	fieldFilePath := writeFieldFile(t, tmpDir, "fieldfile", fieldNames)
 
-	toolOpts, err := testutil.GetToolOptions()
+	toolOpts, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	toolOpts.Namespace = &options.Namespace{DB: dbName, Collection: collName}
 	mi, err := New(Options{
@@ -1710,6 +1770,399 @@ func TestImportExtraFields(t *testing.T) {
 	assert.Equal(t, "extra1", doc["field4"], "field4 should contain first extra value")
 	assert.Equal(t, "extra2", doc["field5"], "field5 should contain second extra value")
 	assert.Equal(t, "extra3", doc["field6"], "field6 should contain third extra value")
+}
+
+// typedFieldHeader's date_oracle layout has a comma, which is what makes this header worth testing
+// through all three ways of supplying it: the CSV file has to quote the cell, the TSV file does
+// not, and --fields has to split on commas without splitting inside the parentheses.
+var typedFieldHeader = []string{
+	"a.string()",
+	"b.int32()",
+	"c.xyz.date_oracle(Month dd, yyyy HH24:mi:ss)",
+	"c.noop.boolean()",
+	"d.hij.lkm.binary(hex)",
+}
+
+const uncoercibleDateStr = "06/08/2016 09:26:00"
+
+// typedTestDates are whole-second dates the typedFieldHeader date_oracle layout can express: a
+// four-digit year, a zero-padded day, and no sub-second part. They are fixed rather than random so
+// the tests are deterministic, and expressible so each value survives a round trip through a CSV
+// cell and back.
+var typedTestDates = []time.Time{
+	time.Date(2016, time.May, 8, 9, 26, 0, 0, time.UTC),
+	time.Date(2007, time.March, 26, 16, 19, 17, 0, time.UTC),
+}
+
+type row struct {
+	strVal  string
+	intVal  int
+	dateVal maybeValidDate
+	boolVal bool
+	hexVal  string
+}
+
+type maybeValidDate struct {
+	val                  time.Time
+	useUncoercibleString bool
+}
+
+// toBSOND returns a bson.D based on the contents of the row.
+func (r row) toBSOND(t *testing.T) bson.D {
+	t.Helper()
+
+	var d any
+	if r.dateVal.useUncoercibleString {
+		d = uncoercibleDateStr
+	} else {
+		d = bson.NewDateTimeFromTime(r.dateVal.val)
+	}
+
+	return bson.D{
+		{"a", r.strVal},
+		{"b", int32(r.intVal)},
+		{"c", bson.D{{"xyz", d}, {"noop", r.boolVal}}},
+		{"d", bson.D{{"hij", bson.D{{"lkm", hexBinary(t, r.hexVal)}}}}},
+	}
+}
+
+// toStrings returns the row as a string slice.
+func (r row) toStrings() []string {
+	var d string
+	if r.dateVal.useUncoercibleString {
+		// This format cannot be parsed by the spec used in these tests.
+		d = uncoercibleDateStr
+	} else {
+		d = r.dateVal.val.Format("January 02, 2006 15:04:05")
+	}
+
+	return []string{
+		r.strVal,
+		fmt.Sprintf("%d", r.intVal),
+		d,
+		fmt.Sprintf("%v", r.boolVal),
+		r.hexVal,
+	}
+}
+
+// TestImportColumnsHaveTypes checks that --columnsHaveTypes converts each column to the BSON type
+// its spec names, for CSV and TSV, with the column spec coming from --headerline, --fields and
+// --fieldFile in turn. Omitting all three has to fail, since there is nothing left to name the
+// types.
+func TestImportColumnsHaveTypes(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	const dbName = "mongoimport_columnshavetypes_test"
+	const collName = "typed"
+
+	client := newImportTestClient(t, dbName)
+	tmpDir := t.TempDir()
+
+	date1 := typedTestDates[0]
+	date2 := typedTestDates[1]
+	rows := []row{
+		{
+			strVal:  "foo",
+			intVal:  24,
+			dateVal: maybeValidDate{val: date1},
+			boolVal: false,
+			hexVal:  "746573740a",
+		},
+		{
+			strVal:  "bar",
+			intVal:  12,
+			dateVal: maybeValidDate{val: date2},
+			boolVal: true,
+			hexVal:  "7bc3049f36681723260fb5921dd36b149c8493c3",
+		},
+	}
+
+	// docsWithoutIDs sorts by a, so the expected order is bar (rows[1]) then foo (rows[0]).
+	expected := []bson.D{
+		rows[1].toBSOND(t),
+		rows[0].toBSOND(t),
+	}
+	typedFieldRows := [][]string{
+		rows[0].toStrings(),
+		rows[1].toStrings(),
+	}
+
+	formats := []struct {
+		format    string
+		separator rune
+	}{
+		{"csv", ','},
+		{"tsv", '\t'},
+	}
+
+	for _, f := range formats {
+		headerFile := filepath.Join(tmpDir, "typed_header."+f.format)
+		writeXSVFile(
+			t,
+			headerFile,
+			f.separator,
+			append([][]string{typedFieldHeader}, typedFieldRows...),
+		)
+		noHeaderFile := filepath.Join(tmpDir, "typed_noheader."+f.format)
+		writeXSVFile(t, noHeaderFile, f.separator, typedFieldRows)
+		fieldFilePath := writeFieldFile(t, tmpDir, "typedfieldfile."+f.format, typedFieldHeader)
+
+		inlineFields := strings.Join(typedFieldHeader, ",")
+		specs := []struct {
+			name  string
+			file  string
+			input InputOptions
+		}{
+			{"headerline", headerFile, InputOptions{HeaderLine: true}},
+			{"fields", noHeaderFile, InputOptions{Fields: &inlineFields}},
+			{"fieldFile", noHeaderFile, InputOptions{FieldFile: &fieldFilePath}},
+		}
+		for _, spec := range specs {
+			t.Run(f.format+"/"+spec.name, func(t *testing.T) {
+				coll := client.Database(dbName).Collection(collName)
+				require.NoError(t, coll.Drop(t.Context()))
+
+				input := spec.input
+				input.File = spec.file
+				input.Type = f.format
+				input.ColumnsHaveTypes = true
+				input.ParseGrace = "stop"
+				require.NoError(t,
+					runTypedImport(t, dbName, collName, input),
+					"typed import succeeds",
+				)
+
+				assert.Equal(
+					t,
+					expected,
+					docsWithoutIDs(t, coll),
+					"every column is converted to the type its spec names",
+				)
+			})
+		}
+
+		t.Run(f.format+"/noColumnSpec", func(t *testing.T) {
+			err := runTypedImport(t, dbName, collName, InputOptions{
+				File:             noHeaderFile,
+				Type:             f.format,
+				ColumnsHaveTypes: true,
+				ParseGrace:       "stop",
+			})
+			assert.ErrorContains(
+				t,
+				err,
+				"must specify --fields, --fieldFile or --headerline",
+				"a typed import with no column spec is rejected",
+			)
+		})
+
+		t.Run(f.format+"/extraColumns", func(t *testing.T) {
+			coll := client.Database(dbName).Collection(collName)
+			require.NoError(t, coll.Drop(t.Context()))
+
+			extraRow := append([]string{"one", "2", "May 08, 2016 09:26:00", "false", "746573740a"},
+				"extra1", "extra2")
+			extraFile := filepath.Join(tmpDir, "typed_extrafields."+f.format)
+			writeXSVFile(t, extraFile, f.separator, append(slices.Clone(typedFieldRows), extraRow))
+
+			require.NoError(t, runTypedImport(t, dbName, collName, InputOptions{
+				File:             extraFile,
+				Type:             f.format,
+				FieldFile:        &fieldFilePath,
+				ColumnsHaveTypes: true,
+				ParseGrace:       "stop",
+			}), "typed import of a row with extra columns succeeds")
+
+			var doc bson.M
+			require.NoError(t, coll.FindOne(t.Context(), bson.D{{"a", "one"}}).Decode(&doc))
+			assert.Equal(
+				t,
+				"extra1",
+				doc["field5"],
+				"the first column past the spec is named for its position",
+			)
+			assert.Equal(
+				t,
+				"extra2",
+				doc["field6"],
+				"the second column past the spec is named for its position",
+			)
+		})
+	}
+}
+
+// TestImportParseGraceModes checks the four --parseGrace modes against a row whose date column does
+// not match the layout its spec names. The modes differ only in what happens to that one row, so
+// all four are run over the same file.
+func TestImportParseGraceModes(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+
+	const dbName = "mongoimport_parsegrace_test"
+	const collName = "parsegrace"
+
+	client := newImportTestClient(t, dbName)
+
+	date1 := typedTestDates[0]
+	date2 := typedTestDates[1]
+	// Only the middle row differs from the typed-fields rows: its date is written in a layout the
+	// date_oracle spec cannot parse.
+	rows := []row{
+		{
+			strVal:  "foo",
+			intVal:  24,
+			dateVal: maybeValidDate{val: date1},
+			boolVal: false,
+			hexVal:  "746573740a",
+		},
+		{
+			strVal:  "bar",
+			intVal:  12,
+			dateVal: maybeValidDate{useUncoercibleString: true},
+			boolVal: true,
+			hexVal:  "7bc3049f36681723260fb5921dd36b149c8493c3",
+		},
+		{
+			strVal:  "baz",
+			intVal:  36,
+			dateVal: maybeValidDate{val: date2},
+			boolVal: false,
+			hexVal:  "abc123",
+		},
+	}
+
+	csvPath := filepath.Join(t.TempDir(), "parse_grace.csv")
+	writeXSVFile(
+		t,
+		csvPath,
+		',',
+		append(
+			[][]string{typedFieldHeader},
+			rows[0].toStrings(),
+			rows[1].toStrings(),
+			rows[2].toStrings(),
+		),
+	)
+
+	fooDoc := rows[0].toBSOND(t)
+	bazDoc := rows[2].toBSOND(t)
+
+	// The bad row is either dropped, kept without the field that would not convert, or kept with
+	// that field left as the string it was read as.
+	barSkippedFieldDoc := bson.D{
+		{"a", rows[1].strVal},
+		{"b", int32(rows[1].intVal)},
+		{"c", bson.D{{"noop", rows[1].boolVal}}},
+		{"d", bson.D{{"hij", bson.D{{"lkm", hexBinary(t, rows[1].hexVal)}}}}},
+	}
+	barAutoCastDoc := bson.D{
+		{"a", rows[1].strVal},
+		{"b", int32(rows[1].intVal)},
+		{"c", bson.D{{"xyz", uncoercibleDateStr}, {"noop", rows[1].boolVal}}},
+		{"d", bson.D{{"hij", bson.D{{"lkm", hexBinary(t, rows[1].hexVal)}}}}},
+	}
+
+	// docsWithoutIDs sorts by a, hence bar, baz, foo.
+	cases := []struct {
+		parseGrace string
+		expected   []bson.D
+	}{
+		{"skipRow", []bson.D{bazDoc, fooDoc}},
+		{"skipField", []bson.D{barSkippedFieldDoc, bazDoc, fooDoc}},
+		{"autoCast", []bson.D{barAutoCastDoc, bazDoc, fooDoc}},
+	}
+	for _, c := range cases {
+		t.Run(c.parseGrace, func(t *testing.T) {
+			coll := client.Database(dbName).Collection(collName)
+			require.NoError(t, coll.Drop(t.Context()))
+
+			require.NoError(t, runTypedImport(t, dbName, collName, InputOptions{
+				File:             csvPath,
+				Type:             "csv",
+				HeaderLine:       true,
+				ColumnsHaveTypes: true,
+				ParseGrace:       c.parseGrace,
+			}), "import with --parseGrace=%s succeeds", c.parseGrace)
+
+			assert.Equal(
+				t,
+				c.expected,
+				docsWithoutIDs(t, coll),
+				"--parseGrace=%s handles the uncoercible field as documented",
+				c.parseGrace,
+			)
+		})
+	}
+
+	t.Run("stop", func(t *testing.T) {
+		coll := client.Database(dbName).Collection(collName)
+		require.NoError(t, coll.Drop(t.Context()))
+
+		err := runTypedImport(t, dbName, collName, InputOptions{
+			File:             csvPath,
+			Type:             "csv",
+			HeaderLine:       true,
+			ColumnsHaveTypes: true,
+			ParseGrace:       "stop",
+		})
+		require.ErrorContains(
+			t,
+			err,
+			uncoercibleDateStr,
+			"--parseGrace=stop fails and names the value it could not parse",
+		)
+
+		// Only the bad row itself is guaranteed absent. Stopping is not rolling back, so rows read
+		// before it may already have reached an insert worker, and rows after it may have been
+		// converted concurrently by another decoding worker before the error canceled the group.
+		n, err := coll.CountDocuments(t.Context(), bson.D{{"a", "bar"}})
+		require.NoError(t, err)
+		assert.Zero(t, n, "--parseGrace=stop does not import the row it could not convert")
+	})
+}
+
+func hexBinary(t *testing.T, encoded string) bson.Binary {
+	t.Helper()
+	data, err := hex.DecodeString(encoded)
+	require.NoError(t, err, "the expected binary data decodes")
+	return bson.Binary{Subtype: 0x00, Data: data}
+}
+
+func runTypedImport(t *testing.T, dbName, collName string, input InputOptions) error {
+	t.Helper()
+	toolOpts, err := testopts.GetToolOptions()
+	require.NoError(t, err)
+	toolOpts.Namespace = &options.Namespace{DB: dbName, Collection: collName}
+	mi, err := New(Options{
+		ToolOptions:   toolOpts,
+		InputOptions:  &input,
+		IngestOptions: &IngestOptions{},
+	})
+	if err != nil {
+		return err
+	}
+	defer mi.Close()
+	_, _, err = mi.ImportDocuments()
+	return err
+}
+
+// docsWithoutIDs returns every document in coll ordered by the "a" field, with the server-assigned
+// _id removed so the result can be compared against the rows that were imported.
+func docsWithoutIDs(t *testing.T, coll *mongo.Collection) []bson.D {
+	t.Helper()
+	cursor, err := coll.Find(
+		t.Context(),
+		bson.D{},
+		mopt.Find().
+			SetProjection(bson.D{{"_id", 0}}).
+			SetSort(bson.D{{"a", 1}}),
+	)
+	require.NoError(t, err)
+	defer cursor.Close(t.Context())
+
+	var docs []bson.D
+	require.NoError(t, cursor.All(t.Context(), &docs))
+
+	return docs
 }
 
 // TestImportModeUpsertFields tests --mode with --upsertFields a,c (compound key matching).
@@ -1905,25 +2358,17 @@ func TestImportModeByID(t *testing.T) {
 
 func newImportTestClient(t *testing.T, dbName string) *mongo.Client {
 	t.Helper()
-	ssl := testutil.GetSSLOptions()
-	auth := testutil.GetAuthOptions()
-	sessionProvider, err := db.NewSessionProvider(options.ToolOptions{
-		General: &options.General{},
-		SSL:     &ssl,
-		Connection: &options.Connection{
-			Host: "localhost",
-			Port: db.DefaultTestPort,
-		},
-		Auth:         &auth,
-		URI:          &options.URI{},
-		Namespace:    &options.Namespace{},
-		WriteConcern: wcwrapper.Majority(),
-	})
+	toolOptions, err := testopts.GetToolOptions()
+	require.NoError(t, err, "should get tool options")
+	sessionProvider, err := db.NewSessionProvider(*toolOptions)
 	require.NoError(t, err, "should create session provider")
 	client, err := sessionProvider.GetSession()
 	require.NoError(t, err, "should get session")
 	t.Cleanup(func() {
-		_ = client.Database(dbName).Drop(t.Context())
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		require.NoError(t, client.Database(dbName).Drop(ctx))
+		sessionProvider.Close()
 	})
 	return client
 }
@@ -1935,7 +2380,7 @@ func importCollection(
 	ingestOpts IngestOptions,
 ) error {
 	t.Helper()
-	toolOptions, err := testutil.GetToolOptions()
+	toolOptions, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	toolOptions.Namespace = ns
 	mi, err := New(Options{
@@ -1953,7 +2398,7 @@ func importCollection(
 
 func importFromFile(t *testing.T, filePath, dbOverride, collOverride string) {
 	t.Helper()
-	toolOpts, err := testutil.GetToolOptions()
+	toolOpts, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	toolOpts.Namespace = &options.Namespace{DB: dbOverride, Collection: collOverride}
 	mi, err := New(Options{
@@ -2075,7 +2520,7 @@ func testImportFieldsForFormat(
 	})
 
 	t.Run(format+"/noFieldSpec", func(t *testing.T) {
-		toolOpts, err := testutil.GetToolOptions()
+		toolOpts, err := testopts.GetToolOptions()
 		require.NoError(t, err)
 		toolOpts.Namespace = &options.Namespace{DB: dbName, Collection: format + "testcoll"}
 		_, err = New(Options{
@@ -2101,7 +2546,7 @@ func importAndCheckFields(t *testing.T, client *mongo.Client, o importFieldsOpts
 	t.Helper()
 	collName := o.format + "testcoll"
 	require.NoError(t, client.Database(o.dbName).Collection(collName).Drop(t.Context()))
-	toolOpts, err := testutil.GetToolOptions()
+	toolOpts, err := testopts.GetToolOptions()
 	require.NoError(t, err)
 	toolOpts.Namespace = &options.Namespace{DB: o.dbName, Collection: collName}
 	var ffPtr *string

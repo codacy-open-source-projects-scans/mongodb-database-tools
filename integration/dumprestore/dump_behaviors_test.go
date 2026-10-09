@@ -1,0 +1,178 @@
+package dumprestore
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	mopt "go.mongodb.org/mongo-driver/v2/mongo/options"
+)
+
+type extendedJSONQueryCase struct {
+	name string
+
+	// matching and other are the two documents inserted. Only matching is expected to be found by
+	// the query.
+	matching bson.D
+	other    bson.D
+
+	// query is passed to mongodump verbatim, as it would be on a command line.
+	query string
+
+	// wantXType, when set, is a zero value of the BSON type the matching document's "x" field must
+	// come back as. Checking the type is the point of the test. An extended JSON value parsed as a
+	// plain subdocument would still match nothing, but one parsed as the wrong BSON type could
+	// match by accident.
+	wantXType any
+}
+
+// TestDumpExtendedJSONQuery checks that `--query` values written in extended JSON reach the server
+// as the BSON types they denote, rather than as the documents they look like. Each case inserts one
+// document the query should match and one it should not, so a query parsed into the wrong type
+// matches neither and the count assertion fails.
+func (s *DumpRestoreSuite) TestDumpExtendedJSONQuery() {
+	// A fixed instant, so the query string and the stored value cannot disagree about
+	// sub-millisecond precision.
+	when := time.Date(2021, time.March, 4, 5, 6, 7, 0, time.UTC)
+	otherWhen := when.Add(-24 * time.Hour)
+
+	matchingID := bson.NewObjectID()
+	otherID := bson.NewObjectID()
+
+	cases := []extendedJSONQueryCase{
+		{
+			name:     "date",
+			matching: bson.D{{"_id", 1}, {"x", when}},
+			other:    bson.D{{"_id", 2}, {"x", otherWhen}},
+			query: fmt.Sprintf(
+				`{"x": {"$date": {"$numberLong": "%d"}}}`,
+				when.UnixMilli(),
+			),
+			wantXType: bson.DateTime(0),
+		},
+		{
+			name:      "regular expression",
+			matching:  bson.D{{"_id", 1}, {"x", bson.Regex{Pattern: "bacon", Options: "i"}}},
+			other:     bson.D{{"_id", 2}, {"x", bson.Regex{Pattern: "bacon"}}},
+			query:     `{"x": {"$regularExpression": {"pattern": "bacon", "options": "i"}}}`,
+			wantXType: bson.Regex{},
+		},
+		{
+			name:     "object id",
+			matching: bson.D{{"_id", matchingID}},
+			other:    bson.D{{"_id", otherID}},
+			query:    `{"_id": {"$oid": "` + matchingID.Hex() + `"}}`,
+		},
+		{
+			name:      "min key",
+			matching:  bson.D{{"_id", 1}, {"x", bson.MinKey{}}},
+			other:     bson.D{{"_id", 2}, {"x", 1}},
+			query:     `{"x": {"$minKey": 1}}`,
+			wantXType: bson.MinKey{},
+		},
+		{
+			name:      "max key",
+			matching:  bson.D{{"_id", 1}, {"x", bson.MaxKey{}}},
+			other:     bson.D{{"_id", 2}, {"x", 1}},
+			query:     `{"x": {"$maxKey": 1}}`,
+			wantXType: bson.MaxKey{},
+		},
+	}
+
+	for _, queryCase := range cases {
+		s.Run(queryCase.name, func() {
+			s.assertExtendedJSONQueryFilters(queryCase)
+		})
+	}
+}
+
+func (s *DumpRestoreSuite) assertExtendedJSONQueryFilters(queryCase extendedJSONQueryCase) {
+	const collName = "bar"
+
+	testDB := s.database("extjson_query_" + strings.ReplaceAll(queryCase.name, " ", "_"))
+	coll := testDB.Collection(collName)
+
+	_, err := coll.InsertMany(s.Context(), []any{queryCase.matching, queryCase.other})
+	s.Require().NoError(err, "can insert the two documents")
+
+	s.withBSONMongodump(func(dir string) {
+		s.dropDB(testDB)
+
+		result := s.runRestore(dir)
+		s.Require().NoError(result.Err, "can restore the filtered dump")
+		s.Require().EqualValues(
+			1,
+			result.Successes,
+			"the query selected exactly the one matching document",
+		)
+	},
+		"--db", testDB.Name(),
+		"--collection", collName,
+		"--query", queryCase.query,
+	)
+
+	var restored []struct {
+		ID any `bson:"_id"`
+		X  any `bson:"x"`
+	}
+	cursor, err := coll.Find(s.Context(), bson.D{})
+	s.Require().NoError(err, "can read the restored documents")
+	s.Require().NoError(cursor.All(s.Context(), &restored), "can decode the restored documents")
+
+	s.Require().Len(restored, 1, "only the matching document is restored")
+	// EqualValues, because an int that was inserted comes back from the server as an int32.
+	s.Assert().EqualValues(
+		queryCase.matching[0].Value,
+		restored[0].ID,
+		"the restored document is the one the query matched, not the other one",
+	)
+
+	if queryCase.wantXType != nil {
+		s.Assert().IsType(
+			queryCase.wantXType,
+			restored[0].X,
+			"the matched value round-trips as the BSON type the query named",
+		)
+	}
+}
+
+// TestDumpStorageEngineOptions round-trips a collection created with storage-engine options, and
+// checks that the options themselves survive rather than only that the dump and restore succeeded.
+func (s *DumpRestoreSuite) TestDumpStorageEngineOptions() {
+	const collName = "testcoll"
+
+	testDB := s.database("storage_engine_options")
+
+	storageEngine := bson.D{
+		{"wiredTiger", bson.D{{"configString", "block_compressor=zlib"}}},
+	}
+	s.createCollection(
+		testDB,
+		collName,
+		mopt.CreateCollection().SetStorageEngine(storageEngine),
+	)
+
+	storageEngineBefore := s.collectionOption(testDB, collName, "storageEngine")
+	s.Require().NotNil(
+		storageEngineBefore,
+		"the server reports the storage engine options that were asked for",
+	)
+
+	s.insertNamespacedDocs(testDB.Collection(collName))
+
+	s.withBSONMongodump(func(dir string) {
+		s.dropDB(testDB)
+
+		result := s.runRestore(dir)
+		s.Require().NoError(result.Err, "can restore a dump with storage engine options")
+		s.requireInserted(result, 1)
+	}, "--db", testDB.Name())
+
+	s.assertDocsCameFrom(testDB.Collection(collName), testDB.Name()+"."+collName)
+	s.Assert().Equal(
+		storageEngineBefore,
+		s.collectionOption(testDB, collName, "storageEngine"),
+		"the storage engine options survive the round trip",
+	)
+}

@@ -10,9 +10,12 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/json"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -33,7 +36,6 @@ import (
 	"github.com/mongodb/mongo-tools/release/platform"
 	"github.com/mongodb/mongo-tools/release/version"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/mod/semver"
 )
 
 // These are the binaries that are part of mongo-tools, relative
@@ -143,15 +145,10 @@ func main() {
 				},
 			},
 			{
-				Name: "download-mongod-and-shell",
+				Name: "download-shell",
 				Action: func(cCtx *cli.Context) error {
-					downloadMongodAndShell(cCtx.String("server-version"))
+					downloadShell()
 					return nil
-				},
-				Flags: []cli.Flag{
-					&cli.StringFlag{
-						Name: "server-version",
-					},
 				},
 			},
 			{
@@ -346,7 +343,7 @@ func getLibraryPaths() []string {
 	check(err, "ldd\n"+out)
 
 	ret := []string{}
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		sp := strings.Split(line, "=>")
 		if len(sp) < 2 {
 			continue
@@ -471,7 +468,7 @@ func buildRPM() {
 
 	outputPath := filepath.Join(home, "rpmbuild", "RPMS", rpmFilename)
 
-	// ensure that the _topdir macro used by rpmbuild references a writeable location
+	// ensure that the _topdir macro used by rpmbuild references a writable location
 	topdirDefine := "_topdir " + filepath.Join(home, "rpmbuild")
 
 	// create the .rpm file.
@@ -1107,7 +1104,12 @@ func uploadReleaseJSON(v version.Version) {
 					Sha256: sha256sum,
 				}
 			} else {
-				dl.Package = &download.ToolsPackage{URL: artifactURL, Md5: md5sum, Sha1: sha1sum, Sha256: sha256sum}
+				dl.Package = &download.ToolsPackage{
+					URL:    artifactURL,
+					Md5:    md5sum,
+					Sha1:   sha1sum,
+					Sha256: sha256sum,
+				}
 			}
 		}
 
@@ -1259,8 +1261,8 @@ var linuxRepoVersionsStable = []LinuxRepo{
 	{"6.0", "6.0.0"}, // any 6.0 stable release version will send the package to the "6.0" repo
 	{"7.0", "7.0.0"}, // any 7.0 stable release version will send the package to the "7.0" repo
 	{"8.0", "8.0.0"}, // any 8.0 stable release version will send the package to the "8.0" repo
-	{"8.2", "8.2.0"}, // any 8.2 stable release version will send the package to the "8.2" repo
 	{"8.3", "8.3.0"}, // any 8.3 stable release version will send the package to the "8.3" repo
+	{"9.0", "9.0.0"}, // any 9.0 stable release version will send the package to the "9.0" repo
 }
 
 var linuxRepoVersionsUnstable = []LinuxRepo{
@@ -1312,9 +1314,17 @@ func linuxRelease(v version.Version) {
 	tasks, err := evergreen.GetTasksForBuild(buildID)
 	check(err, "get evergreen tasks")
 
+	var distTaskName string
+	switch pf.Arch {
+	case platform.ArchS390x, platform.ArchPpc64le:
+		distTaskName = "dist-without-mise"
+	default:
+		distTaskName = "dist"
+	}
+
 	distTasks := []evergreen.Task{}
 	for _, task := range tasks {
-		if task.IsPatch() || task.DisplayName != "dist" {
+		if task.IsPatch() || task.DisplayName != distTaskName {
 			continue
 		}
 
@@ -1401,9 +1411,7 @@ func linuxRelease(v version.Version) {
 						// Remove sensitive information from curator input and log
 						curatorArgsLog := append([]string{}, curatorArgs...)
 						envOverridesLog := make(map[string]string)
-						for k, v := range envOverrides {
-							envOverridesLog[k] = v
-						}
+						maps.Copy(envOverridesLog, envOverrides)
 						apiKeyIdex := findArgIndex(curatorArgsLog, "--api_key")
 						if apiKeyIdex >= 0 {
 							curatorArgsLog[apiKeyIdex] = "[REDACTED]"
@@ -1452,50 +1460,152 @@ func canPerformStableRelease(v version.Version) bool {
 	return v.IsStable() && env.EvgIsTagTriggered() && !env.IsFakeTag()
 }
 
-func downloadMongodAndShell(v string) {
-	err := os.Mkdir("bin", 0700)
-	if err != nil && !os.IsExist(err) {
-		check(err, "create bin dir")
-	}
+// downloadShell downloads the jstestshell that matches the Server binaries already extracted into
+// bin/. Server release tarballs stopped shipping the legacy `mongo` shell at 6.0, so older servers
+// keep the shell that came with their tarball and need nothing here.
+func downloadShell() {
+	mongodPath, err := findMongod()
+	check(err, "find the downloaded mongod")
 
-	pf, err := platform.GetFromEnv()
-	check(err, "get platform")
+	serverVersion, versionString, err := mongodVersion(mongodPath)
+	check(err, "read the server version from %q", mongodPath)
 
-	feedURL := "http://downloads.mongodb.org/full.json"
-
-	var feed download.ServerJSONFeed
-
-	res, err := http.Get(feedURL)
-	check(err, "get the server JSON feed")
-
-	err = json.NewDecoder(res.Body).Decode(&feed)
-	check(err, "decode JSON feed")
-
-	url, githash, serverVersion, err := feed.FindURLHashAndVersion(
-		v,
-		pf,
-		"enterprise",
-	)
-	if err == download.ServerURLMissingError {
-		// If a server version is not found from JSON feed, handle this by downloading the artifacts from evergreen.
-		fmt.Printf("warning: download a version not found in JSON feed\n")
-		fmt.Printf("warning: using a guessed version (%s)\n", serverVersion)
-		downloadArtifacts(serverVersion, []string{"Jstestshell", "Dist Tarball"})
+	if serverVersion.Major < 6 {
+		fmt.Printf(
+			"the %s server ships the mongo shell in its tarball; skipping the jstestshell download\n",
+			versionString,
+		)
 		return
 	}
 
-	check(err, "get URL from JSON feed")
-
-	fmt.Printf("URL: %v\n", url)
-	fmt.Printf("GitHash: %v\n", githash)
-	fmt.Printf("Version: %v\n", serverVersion)
-
-	downloadBinaries(url)
-
-	if semver.Compare(fmt.Sprintf("v%s", serverVersion), "v6.0.0") >= 0 {
-		// serverVersion >= 6.0.0, download mongo shell.
-		downloadArtifacts(serverVersion, []string{"Jstestshell"})
+	majorMinor := fmt.Sprintf("%d.%d", serverVersion.Major, serverVersion.Minor)
+	shellVersion, ok := jstestshellVersions[majorMinor]
+	if !ok {
+		// Keep the full version string, including any -rcN suffix, for the Evergreen lookup.
+		shellVersion = versionString
 	}
+
+	if shellVersion != versionString {
+		fmt.Printf(
+			"using the jstestshell from %s with the %s server\n",
+			shellVersion,
+			versionString,
+		)
+	}
+
+	downloadArtifacts(shellVersion, []string{"Jstestshell"})
+}
+
+// findMongod returns the path to the Server binary downloaded by mongodb-downloader. It looks for
+// both the Unix and Windows names so callers do not have to detect the platform themselves.
+//
+// The path is absolute because Go's os/exec on Windows refuses to run a relative executable whose
+// working directory it cannot prove is absolute (see the EVG_WORKDIR handling in ci-env.sh).
+func findMongod() (string, error) {
+	for _, name := range []string{"bin/mongod", "bin/mongod.exe"} {
+		if fileExists(name) {
+			return filepath.Abs(name)
+		}
+	}
+
+	return "", fmt.Errorf("no mongod found in bin/; run mongodb-downloader download first")
+}
+
+// mongodVersionRE pulls the version out of the first line of `mongod --version`, which looks like
+// "db version v8.0.5" or "db version v9.0.0-rc0".
+var mongodVersionRE = regexp.MustCompile(`db version v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
+
+// mongodVersion parses the Server version reported by the given mongod binary. It returns both the
+// parsed version and the full version string, since the latter keeps a pre-release suffix that the
+// parsed version drops.
+func mongodVersion(mongodPath string) (version.Version, string, error) {
+	out, err := run(mongodPath, "--version")
+	if err != nil {
+		return version.Version{}, "", err
+	}
+
+	matches := mongodVersionRE.FindStringSubmatch(out)
+	if len(matches) < 2 {
+		return version.Version{}, "", fmt.Errorf(
+			"could not find a server version in the output of %q",
+			mongodPath,
+		)
+	}
+
+	sv, err := version.Parse(matches[1])
+	if err != nil {
+		return version.Version{}, "", err
+	}
+
+	return sv, matches[1], nil
+}
+
+// jstestshellVersions pins the jstestshell version to download for each server major.minor.
+//
+// The jstestshell comes from Evergreen rather than the releases we download from the feed, so it can
+// be missing for a patch release whose server tarball is published and healthy. The shell is only a
+// client we use to drive mongod and does not have to match the server it talks to, so instead of
+// tracking whatever patch release the feed hands us, we pin a version known to be downloadable.
+// Update these as needed, e.g. when adding support for a new server release.
+var jstestshellVersions = map[string]string{
+	"6.0": "6.0.29",
+	"7.0": "7.0.39",
+	"8.0": "8.0.28",
+	"8.2": "8.2.12",
+	"8.3": "8.3.7",
+	"9.0": "9.0.0",
+}
+
+// s3ErrorResponse is the XML document S3 serves in place of the requested object when a
+// request fails. Presigned URLs from Evergreen artifacts are served by S3, so this is what
+// comes back when, say, the credentials they were signed with have been rotated away.
+type s3ErrorResponse struct {
+	Code      string `xml:"Code"`
+	Message   string `xml:"Message"`
+	RequestID string `xml:"RequestId"`
+}
+
+// s3CredentialErrorCodes are the S3 error codes that mean the request was not accepted,
+// as opposed to the object being missing or the service being unhappy.
+var s3CredentialErrorCodes = mapset.NewSet(
+	"AccessDenied",
+	"ExpiredToken",
+	"InvalidAccessKeyId",
+	"InvalidToken",
+	"RequestTimeTooSkewed",
+	"SignatureDoesNotMatch",
+	"TokenRefreshRequired",
+)
+
+// checkDownloadResponse returns an error describing why a download did not return the
+// artifact, or nil if it did.
+func checkDownloadResponse(res *http.Response) error {
+	if res.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	// An error body is a short XML or HTML document. Anything longer is not something we
+	// want in a log line, and we already have the status to report.
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4096))
+	if err != nil {
+		return fmt.Errorf("got %s and could not read the response body: %w", res.Status, err)
+	}
+
+	var s3Err s3ErrorResponse
+	if xml.Unmarshal(body, &s3Err) != nil || s3Err.Code == "" {
+		return fmt.Errorf("got %s: %s", res.Status, strings.TrimSpace(string(body)))
+	}
+
+	msg := fmt.Sprintf("got %s from S3: %s: %s", res.Status, s3Err.Code, s3Err.Message)
+	if s3Err.RequestID != "" {
+		msg += fmt.Sprintf(" (request ID %s)", s3Err.RequestID)
+	}
+	if s3CredentialErrorCodes.Contains(s3Err.Code) {
+		msg += ". The AWS credentials the URL was signed with are not valid, which is a" +
+			" problem with the credentials rather than with this build"
+	}
+
+	return errors.New(msg)
 }
 
 func downloadBinaries(url string) {
@@ -1511,6 +1621,11 @@ func downloadBinaries(url string) {
 
 	res, err := http.Get(url)
 	check(err, "get the server package")
+	defer res.Body.Close()
+
+	// Without this, an error response gets written to disk and then fails much later as a
+	// corrupt archive, which says nothing about why the download did not work.
+	check(checkDownloadResponse(res), "download %s", filename)
 
 	_, err = io.Copy(packageFile, res.Body)
 	check(err, "write server package file")
@@ -1682,6 +1797,11 @@ func downloadArtifacts(v string, artifactNames []string) {
 	)
 
 	check(err, "get git hash")
+	// git log exits 0 with no output when nothing matches, which would otherwise turn into a
+	// lookup for the bogus Evergreen version "mongo_release_".
+	if githash == "" {
+		log.Fatalf("no mongo-release commit matches %#q", grepArg)
+	}
 	fmt.Printf("Git hash: %s\n", githash)
 
 	evgVersion := fmt.Sprintf("mongo_release_%s", githash)

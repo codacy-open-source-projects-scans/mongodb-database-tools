@@ -42,8 +42,12 @@ func TestPlatformsMatchCI(t *testing.T) {
 	for _, v := range config.Variants {
 		// Variant "mongodump_passthru_v" has been added to support mongodump
 		// passthrough testing.
+		//
+		// Variant "ubuntu2204-arm64-dsc" only runs the integration suite against a
+		// disaggregated-storage cluster. It never builds anything we release.
 		if v.Name == "release" || v.Name == "static" || v.Name == "rhel88-race" ||
-			v.Name == "mongodump_passthru_v" {
+			v.Name == "mongodump_passthru_v" || v.Name == "merge-queue" ||
+			v.Name == "ubuntu2204-arm64-dsc" {
 			continue
 		}
 
@@ -51,7 +55,11 @@ func TestPlatformsMatchCI(t *testing.T) {
 			releasePlatforms[v.Name] = true
 		} else if _, ok := s3OnlyPlatforms[v.Name]; ok {
 			for _, t := range v.Tasks {
-				assert.NotEqual(t.Name, "push", "s3-only buildvariants should not include the push task")
+				assert.NotEqual(
+					t.Name,
+					"push",
+					"s3-only buildvariants should not include the push task",
+				)
 			}
 		} else {
 			assert.Fail(

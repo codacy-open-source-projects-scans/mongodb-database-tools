@@ -1,5 +1,210 @@
 # Database Tools Changelog
 
+## 100.19.1
+
+_Released 2026-09-29_
+
+We are pleased to announce version 100.19.1 of the MongoDB Database Tools.
+
+This release adds support for Debian 13 for MongoDB Community.
+
+The Database Tools are available on the
+[MongoDB Download Center](https://www.mongodb.com/try/download/database-tools). Installation
+instructions and documentation can be found on
+[docs.mongodb.com/database-tools](https://docs.mongodb.com/database-tools/). Questions and inquiries
+can be asked on the
+[MongoDB Developer Community Forum](https://developer.mongodb.com/community/forums/tags/c/developer-tools/49/database-tools).
+Please make sure to tag forum posts with `database-tools`. Bugs and feature requests can be reported
+in the [Database Tools Jira](https://jira.mongodb.org/browse/TOOLS) where a list of current issues
+can be found.
+
+<h2>        Task
+</h2>
+<ul>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4393'>TOOLS-4393</a>]- adds support for Debian 13 for MongoDB Community</li> 
+</ul>
+
+## 100.19.0
+
+We are pleased to announce version 100.19.0 of the MongoDB Database Tools.
+
+The highlight for this release is dependency and Golang upgrades to address a variety of CVEs and a
+fix for mongorestore where it could be tricked into using an unbounded amount of memory with
+malicious input. Note that we strongly recommend against using mongorestore with untrusted input!
+
+The Database Tools are available on the
+[MongoDB Download Center](https://www.mongodb.com/try/download/database-tools). Installation
+instructions and documentation can be found on
+[docs.mongodb.com/database-tools](https://docs.mongodb.com/database-tools/). Questions and inquiries
+can be asked on the
+[MongoDB Developer Community Forum](https://developer.mongodb.com/community/forums/tags/c/developer-tools/49/database-tools).
+Please make sure to tag forum posts with `database-tools`. Bugs and feature requests can be reported
+in the [Database Tools Jira](https://jira.mongodb.org/browse/TOOLS) where a list of current issues
+can be found.
+
+<h2>        Bug
+</h2>
+<ul>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4355'>TOOLS-4355</a>] -         mongorestore could use unbounded memory via unbounded archive concurrent_collections settings</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4330'>TOOLS-4330</a>] -         Some tests use the wrong context in `t.Cleanup`
+</li>
+</ul>
+
+<h2>        Task
+</h2>
+<ul>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4336'>TOOLS-4336</a>] -         The options handling of some timeout values treats them as milliseconds but documents them as seconds
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4338'>TOOLS-4338</a>] -         Error checking in the `MongoDump.Dump` func is backwards
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4346'>TOOLS-4346</a>] -         Upgrade to Golang 1.26.7
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4372'>TOOLS-4372</a>] -         Bump Go toolchain past 1.26.5 to fix 10 stdlib CVEs (fixed in 1.25.13 / 1.26.6 / 1.27.0-rc.3)
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4354'>TOOLS-4354</a>] -         Upgrade Go driver to 2.8.2
+</li>
+</ul>
+
+## 100.18.0
+
+_Released 2026-08-12_
+
+We are pleased to announce version 100.18.0 of the MongoDB Database Tools.
+
+The highlight for this release is MongoDB Server 9.0 support. This release also adds builds for SUSE
+16, Debian 13, Ubuntu 26.04, and RHEL 10 on ppc64le and s390x, and the upgrade to Go 1.26.5.
+
+The Database Tools are available on the
+[MongoDB Download Center](https://www.mongodb.com/try/download/database-tools). Installation
+instructions and documentation can be found on
+[docs.mongodb.com/database-tools](https://docs.mongodb.com/database-tools/). Questions and inquiries
+can be asked on the
+[MongoDB Developer Community Forum](https://developer.mongodb.com/community/forums/tags/c/developer-tools/49/database-tools).
+Please make sure to tag forum posts with `database-tools`. Bugs and feature requests can be reported
+in the [Database Tools Jira](https://jira.mongodb.org/browse/TOOLS) where a list of current issues
+can be found.
+
+### Bug
+
+<ul>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4228'>TOOLS-4228</a>] -         Fix timeseries tests on 8.3+
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4293'>TOOLS-4293</a>] -         oplog_replay_local_rs.js fails because the fake oplog is not visible
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4309'>TOOLS-4309</a>] -         mongodump --oplog must fail on the upgradeDowngradeViewlessTimeseries entry
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4310'>TOOLS-4310</a>] -         Handle dropIdent oplog entries
+</li>
+</ul>
+
+### Task
+
+<ul>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4089'>TOOLS-4089</a>] -         Add MongoDB Server 9.0 support
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4233'>TOOLS-4233</a>] -         Enable govet in golangci-lint and remove redundant Evergreen vet task
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4235'>TOOLS-4235</a>] -         Static analysis and Evergreen config cleanup
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4237'>TOOLS-4237</a>] -         Convert failpoints to a struct-based interface
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4242'>TOOLS-4242</a>] -         Add SUSE 16 support for server 7.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4243'>TOOLS-4243</a>] -         Add RHEL 10 ppc64le support for server 8.0+
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4244'>TOOLS-4244</a>] -         Add Ubuntu 26.04 aarch64 support for server 7.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4245'>TOOLS-4245</a>] -         Add Debian 13 x86_64 support for server 7.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4246'>TOOLS-4246</a>] -         Add SUSE 16 support for server 8.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4247'>TOOLS-4247</a>] -         Add Ubuntu 26.04 x86_64 enterprise support for server 7.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4248'>TOOLS-4248</a>] -         Add RHEL 10 s390x enterprise support for server 7.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4249'>TOOLS-4249</a>] -         Add Ubuntu 26.04 x86_64 targeted support for server 8.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4250'>TOOLS-4250</a>] -         Add Debian 13 x86_64 support for server 8.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4251'>TOOLS-4251</a>] -         Add RHEL 10 ppc64le support for server 7.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4252'>TOOLS-4252</a>] -         Add Ubuntu 26.04 x86_64 enterprise support for server 8.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4253'>TOOLS-4253</a>] -         Add RHEL 10 s390x enterprise support for server 8.0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4279'>TOOLS-4279</a>] -         Update 9.0 version to 9.0.0-rc0
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4280'>TOOLS-4280</a>] -         Upgrade golang.org/x/text and golang.org/x/crypto
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4312'>TOOLS-4312</a>] -         Hint $natural on unfiltered mongodump queries
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4313'>TOOLS-4313</a>] -         Hint $natural on unfiltered, unsorted mongoexport queries
+</li>
+</ul>
+
+## 100.17.0
+
+_Released 2026-05-08_
+
+We are pleased to announce version 100.17.0 of the MongoDB Database Tools.
+
+This release adds builds for RedHat Enterprise Linux 10.
+
+The Database Tools are available on the
+[MongoDB Download Center](https://www.mongodb.com/try/download/database-tools). Installation
+instructions and documentation can be found on
+[docs.mongodb.com/database-tools](https://docs.mongodb.com/database-tools/). Questions and inquiries
+can be asked on the
+[MongoDB Developer Community Forum](https://developer.mongodb.com/community/forums/tags/c/developer-tools/49/database-tools).
+Please make sure to tag forum posts with `database-tools`. Bugs and feature requests can be reported
+in the [Database Tools Jira](https://jira.mongodb.org/browse/TOOLS) where a list of current issues
+can be found.
+
+### Task
+
+<ul>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4195'>TOOLS-4195</a>] -         Add RHEL 10 builds
+</li>
+</ul>
+
+## 100.16.1
+
+_Released 2026-04-24_
+
+We are pleased to announce version 100.16.1 of the MongoDB Database Tools.
+
+This patch release includes a fix for a message size overflow in `BufferedBulkInserter`, along with
+internal maintenance updates such as rewriting JavaScript tests in Go, improving `mongoexport`
+Extended JSON marshalling, and upgrading to Go 1.25.9.
+
+The Database Tools are available on the
+[MongoDB Download Center](https://www.mongodb.com/try/download/database-tools). Installation
+instructions and documentation can be found on
+[docs.mongodb.com/database-tools](https://docs.mongodb.com/database-tools/). Questions and inquiries
+can be asked on the
+[MongoDB Developer Community Forum](https://developer.mongodb.com/community/forums/tags/c/developer-tools/49/database-tools).
+Please make sure to tag forum posts with `database-tools`. Bugs and feature requests can be reported
+in the [Database Tools Jira](https://jira.mongodb.org/browse/TOOLS) where a list of current issues
+can be found.
+
+### Bug
+
+<ul>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4142'>TOOLS-4142</a>] -         Fix OP_MSG size overflow in BufferedBulkInserter
+</li>
+</ul>
+
+### Task
+
+<ul>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4148'>TOOLS-4148</a>] -         Rewrite JS tests in Go
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4184'>TOOLS-4184</a>] -         Use simple MarshalExtJSON in mongoexport
+</li>
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-4194'>TOOLS-4194</a>] -         Upgrade to go 1.25.9
+</li>
+</ul>
+
 ## 100.16.0
 
 _Released 2026-04-01_
@@ -779,7 +984,7 @@ _Released 2023-07-21_
 
 We are pleased to announce version 100.7.4 of the MongoDB Database Tools.
 
-This release fixes issues with mongorestore that ommitted all namespaces containing "admin" when
+This release fixes issues with mongorestore that omitted all namespaces containing "admin" when
 restoring to an Atlas Proxy Cluster. This release also fixes an issue with mongodump where the
 process failed against clusters using Atlas Online Archive.
 
@@ -808,7 +1013,7 @@ _Released 2023-06-26_
 
 We are pleased to announce version 100.7.3 of the MongoDB Database Tools.
 
-This release fixes an issue introduced in 100.7.1 where specifying `mongodump --db=confg` will not
+This release fixes an issue introduced in 100.7.1 where specifying `mongodump --db=config` will not
 dump the entire config collection.
 
 The Database Tools are available on the
@@ -1746,7 +1951,7 @@ can be found.
 </li>
 <li>[<a href='https://jira.mongodb.org/browse/TOOLS-2366'>TOOLS-2366</a>] -         ^C isn&#39;t handled by mongodump
 </li>
-<li>[<a href='https://jira.mongodb.org/browse/TOOLS-2494'>TOOLS-2494</a>] -         mongorestore thorw error &quot;panic: close of closed channel&quot;
+<li>[<a href='https://jira.mongodb.org/browse/TOOLS-2494'>TOOLS-2494</a>] -         mongorestore throw error &quot;panic: close of closed channel&quot;
 </li>
 <li>[<a href='https://jira.mongodb.org/browse/TOOLS-2531'>TOOLS-2531</a>] -         mongorestore hung if restoring views with --preserveUUID --drop options
 </li>

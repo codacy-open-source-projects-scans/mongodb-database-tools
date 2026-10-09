@@ -342,9 +342,14 @@ func (dump *MongoDump) Dump() (err error) {
 		}
 	}
 
-	if failpoint.Enabled(failpoint.PauseBeforeDumping) {
+	if _, ok := failpoint.DefaultManager.Get(failpoint.PauseBeforeDumping); ok {
 		log.Logvf(log.Info, "failpoint.PauseBeforeDumping: sleeping 15 sec")
 		time.Sleep(15 * time.Second)
+	} else if fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed); ok {
+		log.Logvf(log.Info, "failpoint.PauseUntilResumed: waiting for resume signal")
+		if err := fp.Wait(context.TODO()); err != nil {
+			return err
+		}
 	}
 
 	// switch on what kind of execution to do
@@ -467,13 +472,13 @@ func (dump *MongoDump) Dump() (err error) {
 		// we started still exist, so we know we haven't lost data)
 		log.Logvf(log.DebugLow, "checking if oplog entry %v still exists", dump.oplogStart)
 		exists, err := dump.checkOplogTimestampExists(dump.oplogStart)
+		if err != nil {
+			return fmt.Errorf("unable to check oplog for overflow: %w", err)
+		}
 		if !exists {
 			return fmt.Errorf(
 				"oplog overflow: mongodump was unable to capture all new oplog entries during execution",
 			)
-		}
-		if err != nil {
-			return fmt.Errorf("unable to check oplog for overflow: %v", err)
 		}
 		log.Logvf(log.DebugHigh, "oplog entry %v still exists", dump.oplogStart)
 
@@ -489,13 +494,13 @@ func (dump *MongoDump) Dump() (err error) {
 		// we copy it.
 		log.Logvf(log.DebugLow, "checking again if oplog entry %v still exists", dump.oplogStart)
 		exists, err = dump.checkOplogTimestampExists(dump.oplogStart)
+		if err != nil {
+			return fmt.Errorf("unable to check oplog for overflow: %w", err)
+		}
 		if !exists {
 			return fmt.Errorf(
 				"oplog overflow: mongodump was unable to capture all new oplog entries during execution",
 			)
-		}
-		if err != nil {
-			return fmt.Errorf("unable to check oplog for overflow: %v", err)
 		}
 		log.Logvf(log.DebugHigh, "oplog entry %v still exists", dump.oplogStart)
 	}
@@ -640,6 +645,12 @@ func (dump *MongoDump) DumpIntent(intent *intents.Intent, buffer resettableOutpu
 			}
 		}
 		findQuery.Filter = dump.query
+	} else {
+		// An unfiltered dump is a deliberate full collection scan. Saying so with a $natural
+		// hint exempts it from the server's maxEstimatedScanBytes rejection (SERVER-127688)
+		// without changing the plan the server would have chosen anyway. We must not do this
+		// when there is a filter, which could otherwise be served by an index.
+		findQuery.Hint = bson.D{{"$natural", 1}}
 	}
 
 	var dumpCount int64

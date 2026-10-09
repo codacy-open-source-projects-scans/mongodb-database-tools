@@ -170,7 +170,10 @@ func DetectLocal() (Platform, error) {
 		case "Darwin":
 			os = "macos"
 		default:
-			return Platform{}, fmt.Errorf("failed to detect local platform from kernel name %q", kernelName)
+			return Platform{}, fmt.Errorf(
+				"failed to detect local platform from kernel name %q",
+				kernelName,
+			)
 		}
 
 		pf, foundPf = GetByOsAndArch(os, archName)
@@ -438,15 +441,6 @@ var defaultBuildTags = []string{"gssapi", "failpoints"}
 // whether a given platform exists in the list.
 var platforms = []Platform{
 	{
-		Name:                  "amazon",
-		Arch:                  ArchX86_64,
-		OS:                    OSLinux,
-		Pkg:                   PkgRPM,
-		Repos:                 []Repo{RepoEnterprise, RepoOrg},
-		BuildTags:             defaultBuildTags,
-		MaxLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
-	},
-	{
 		Name:                  "amazon2",
 		Arch:                  ArchAarch64,
 		OS:                    OSLinux,
@@ -508,6 +502,15 @@ var platforms = []Platform{
 		ServerVariantNames: mapset.NewSet("enterprise-debian12-64"),
 	},
 	{
+		Name:                  "debian13",
+		Arch:                  ArchX86_64,
+		OS:                    OSLinux,
+		Pkg:                   PkgDeb,
+		Repos:                 []Repo{RepoEnterprise, RepoOrg},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
+	},
+	{
 		Name:                  "debian92",
 		Arch:                  ArchX86_64,
 		OS:                    OSLinux,
@@ -544,6 +547,42 @@ var platforms = []Platform{
 		BuildTags:             defaultBuildTags,
 		SkipForJSONFeed:       true,
 		MaxLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
+	},
+	{
+		Name:                  "rhel10",
+		Arch:                  ArchAarch64,
+		OS:                    OSLinux,
+		Pkg:                   PkgRPM,
+		Repos:                 []Repo{RepoOrg, RepoEnterprise},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 8, Minor: 0, Patch: 0},
+	},
+	{
+		Name:                  "rhel10",
+		Arch:                  ArchPpc64le,
+		OS:                    OSLinux,
+		Pkg:                   PkgRPM,
+		Repos:                 []Repo{RepoEnterprise},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
+	},
+	{
+		Name:                  "rhel10",
+		Arch:                  ArchS390x,
+		OS:                    OSLinux,
+		Pkg:                   PkgRPM,
+		Repos:                 []Repo{RepoEnterprise},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
+	},
+	{
+		Name:                  "rhel10",
+		Arch:                  ArchX86_64,
+		OS:                    OSLinux,
+		Pkg:                   PkgRPM,
+		Repos:                 []Repo{RepoOrg, RepoEnterprise},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 8, Minor: 0, Patch: 0},
 	},
 	{
 		Name:                  "rhel70",
@@ -684,6 +723,15 @@ var platforms = []Platform{
 		BuildTags: defaultBuildTags,
 	},
 	{
+		Name:                  "suse16",
+		Arch:                  ArchX86_64,
+		OS:                    OSLinux,
+		Pkg:                   PkgRPM,
+		Repos:                 []Repo{RepoEnterprise, RepoOrg},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 9, Minor: 0, Patch: 0},
+	},
+	{
 		Name:                  "ubuntu1604",
 		Arch:                  ArchArm64,
 		OS:                    OSLinux,
@@ -720,28 +768,31 @@ var platforms = []Platform{
 		MaxLinuxServerVersion: &version.Version{Major: 7, Minor: 0, Patch: 0},
 	},
 	{
-		Name:      "ubuntu2004",
-		Arch:      ArchArm64,
-		OS:        OSLinux,
-		Pkg:       PkgDeb,
-		Repos:     []Repo{RepoEnterprise, RepoOrg},
-		BuildTags: defaultBuildTags,
+		Name:                  "ubuntu2004",
+		Arch:                  ArchArm64,
+		OS:                    OSLinux,
+		Pkg:                   PkgDeb,
+		Repos:                 []Repo{RepoEnterprise, RepoOrg},
+		BuildTags:             defaultBuildTags,
+		MaxLinuxServerVersion: &version.Version{Major: 8, Minor: 0, Patch: 0},
 	},
 	{
-		Name:      "ubuntu2004",
-		Arch:      ArchX86_64,
-		OS:        OSLinux,
-		Pkg:       PkgDeb,
-		Repos:     []Repo{RepoEnterprise, RepoOrg},
-		BuildTags: defaultBuildTags,
+		Name:                  "ubuntu2004",
+		Arch:                  ArchX86_64,
+		OS:                    OSLinux,
+		Pkg:                   PkgDeb,
+		Repos:                 []Repo{RepoEnterprise, RepoOrg},
+		BuildTags:             defaultBuildTags,
+		MaxLinuxServerVersion: &version.Version{Major: 8, Minor: 0, Patch: 0},
 	},
 	{
-		Name:      "ubuntu2204",
-		Arch:      ArchArm64,
-		OS:        OSLinux,
-		Pkg:       PkgDeb,
-		Repos:     []Repo{RepoEnterprise, RepoOrg},
-		BuildTags: defaultBuildTags,
+		Name:               "ubuntu2204",
+		Arch:               ArchArm64,
+		OS:                 OSLinux,
+		Pkg:                PkgDeb,
+		Repos:              []Repo{RepoEnterprise, RepoOrg},
+		BuildTags:          defaultBuildTags,
+		ServerVariantNames: mapset.NewSet("enterprise-ubuntu2204-arm64"),
 	},
 	{
 		Name:      "ubuntu2204",
@@ -762,6 +813,24 @@ var platforms = []Platform{
 	},
 	{
 		Name:                  "ubuntu2404",
+		Arch:                  ArchX86_64,
+		OS:                    OSLinux,
+		Pkg:                   PkgDeb,
+		Repos:                 []Repo{RepoEnterprise, RepoOrg},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 8, Minor: 0, Patch: 0},
+	},
+	{
+		Name:                  "ubuntu2604",
+		Arch:                  ArchArm64,
+		OS:                    OSLinux,
+		Pkg:                   PkgDeb,
+		Repos:                 []Repo{RepoEnterprise, RepoOrg},
+		BuildTags:             defaultBuildTags,
+		MinLinuxServerVersion: &version.Version{Major: 8, Minor: 0, Patch: 0},
+	},
+	{
+		Name:                  "ubuntu2604",
 		Arch:                  ArchX86_64,
 		OS:                    OSLinux,
 		Pkg:                   PkgDeb,

@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mongodb/mongo-tools/common/bsonutil"
@@ -19,7 +21,6 @@ import (
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/mongodb/mongo-tools/common/testutil"
-	"github.com/mongodb/mongo-tools/common/util"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -38,6 +39,31 @@ func TestErrorOnImportCollection(t *testing.T) {
 	assert.EqualError(t, err, "cannot dump with oplog while importCollection occurs")
 }
 
+func TestErrorOnViewlessTimeseriesConversion(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.UnitTestType)
+
+	rawOp, err := bson.Marshal(db.Oplog{
+		Timestamp: bson.Timestamp{T: 1, I: 1},
+		Version:   2,
+		Operation: "c",
+		Namespace: "test.$cmd",
+		Object: bson.D{
+			{"upgradeDowngradeViewlessTimeseries", "foo_ts"},
+			{"isUpgrade", true},
+		},
+	})
+	require.NoError(t, err)
+
+	err = oplogDocumentValidator(rawOp)
+	assert.EqualError(
+		t,
+		err,
+		"cannot dump with oplog while a timeseries format conversion caused by an FCV "+
+			"change between 8.x and 9.0 occurs",
+		"a dump whose oplog window spans a viewless timeseries conversion is rejected",
+	)
+}
+
 // TestOplogDumpVectoredInsertsOplog tests dumping oplogs that are from vectored inserts.
 // They have a special oplog format.
 func TestOplogDumpVectoredInsertsOplog(t *testing.T) {
@@ -47,7 +73,7 @@ func TestOplogDumpVectoredInsertsOplog(t *testing.T) {
 
 	log.SetWriter(io.Discard)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("Failed to get session: %v", err)
 	}
@@ -70,22 +96,32 @@ func TestOplogDumpVectoredInsertsOplog(t *testing.T) {
 
 	require.NoError(t, md.Init())
 
-	// Enable a failpoint so that the test can create oplogs during dump.
-	failpoint.ParseFailpoints("PauseBeforeDumping")
-	defer failpoint.Reset()
+	// Pause mongodump right after it captures the oplog start time so that the
+	// test can create oplog entries that are guaranteed to fall inside the dump
+	// window, then let it resume.
+	require.NoError(t, failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()))
+	defer failpoint.DefaultManager.Reset()
 
-	require.NoError(t, vectoredInsert(ctx))
 	//nolint:errcheck
 	defer tearDownMongoDumpTestData(t)
 
-	require.NoError(t, md.Dump())
+	dumpErrCh := make(chan error, 1)
+	go func() { dumpErrCh <- md.Dump() }()
+
+	fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+	require.True(t, ok, "PauseUntilResumed failpoint should be enabled")
+	require.NoError(t, fp.Reached(context.TODO()))
+	require.NoError(t, vectoredInsert(t, ctx))
+	fp.Signal()
+
+	require.NoError(t, <-dumpErrCh)
 
 	path, err := os.Getwd()
 	require.NoError(t, err)
 
-	dumpDir := util.ToUniversalPath(filepath.Join(path, "vectored_inserts"))
-	dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
-	oplogFilePath := util.ToUniversalPath(filepath.Join(dumpDir, "oplog.bson"))
+	dumpDir := filepath.FromSlash(filepath.Join(path, "vectored_inserts"))
+	dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
+	oplogFilePath := filepath.FromSlash(filepath.Join(dumpDir, "oplog.bson"))
 	require.True(t, fileDirExists(dumpDir))
 	require.True(t, fileDirExists(dumpDBDir))
 	require.True(t, fileDirExists(oplogFilePath))
@@ -96,17 +132,28 @@ func TestOplogDumpVectoredInsertsOplog(t *testing.T) {
 	require.NoError(t, err)
 	defer oplogFile.Close()
 
-	contents, err := io.ReadAll(oplogFile)
-	require.NoError(t, err)
-
-	var oplog bson.D
-	require.NoError(t, bson.Unmarshal(contents, &oplog))
-
-	require.Equal(t, int32(1), bsonutil.ToMap(oplog)["multiOpType"])
+	// The vectored insert happens during the dump window, so its oplog entry is
+	// somewhere in the dumped oplog but not necessarily the first entry. Scan all
+	// entries and assert that one of them is the vectored (multiOp) insert.
+	bsonSrc := db.NewDecodedBSONSource(db.NewBufferlessBSONSource(oplogFile))
+	foundMultiOpInsert := false
+	var entry bson.M
+	for bsonSrc.Next(&entry) {
+		if entry["multiOpType"] == int32(1) {
+			foundMultiOpInsert = true
+			break
+		}
+	}
+	require.NoError(t, bsonSrc.Err())
+	require.True(
+		t,
+		foundMultiOpInsert,
+		"oplog dump should contain a vectored insert entry with multiOpType == 1",
+	)
 }
 
-func vectoredInsert(ctx context.Context) error {
-	client, err := testutil.GetBareSession()
+func vectoredInsert(t *testing.T, ctx context.Context) error {
+	client, err := testutil.GetBareSession(t)
 	if err != nil {
 		return err
 	}
@@ -119,7 +166,9 @@ func vectoredInsert(ctx context.Context) error {
 				bson.D{{"_id", 100}, {"a", 1}},
 				bson.D{{"_id", 200}, {"a", 2}},
 			}
-			_, insertErr := client.Database(testDB).Collection(testCollectionNames[0]).InsertMany(ctx, docs)
+			_, insertErr := client.Database(testDB).
+				Collection(testCollectionNames[0]).
+				InsertMany(ctx, docs)
 			if insertErr != nil {
 				return insertErr
 			}
@@ -140,7 +189,7 @@ func TestOplogDumpCollModIndexUniqueness(t *testing.T) {
 
 	ctx := t.Context()
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("Failed to get session: %v", err)
 	}
@@ -171,25 +220,31 @@ func TestOplogDumpCollModIndexUniqueness(t *testing.T) {
 
 	require.NoError(t, md.Init())
 
-	// Enable a failpoint so that the test can create oplogs during dump.
-	failpoint.ParseFailpoints(failpoint.PauseBeforeDumping)
-	defer failpoint.Reset()
-
-	go func() {
-		require.NoError(t, createIndexesAndCollModIndexUniqueness(ctx))
-	}()
+	// Pause mongodump right after it captures the oplog start time so that the
+	// test can create oplog entries during the dump window, then let it resume.
+	require.NoError(t, failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()))
+	defer failpoint.DefaultManager.Reset()
 
 	//nolint:errcheck
 	defer tearDownMongoDumpTestData(t)
 
-	require.NoError(t, md.Dump())
+	dumpErrCh := make(chan error, 1)
+	go func() { dumpErrCh <- md.Dump() }()
+
+	fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+	require.True(t, ok, "PauseUntilResumed failpoint should be enabled")
+	require.NoError(t, fp.Reached(context.TODO()))
+	require.NoError(t, createIndexesAndCollModIndexUniqueness(t, ctx))
+	fp.Signal()
+
+	require.NoError(t, <-dumpErrCh)
 
 	path, err := os.Getwd()
 	require.NoError(t, err)
 
-	dumpDir := util.ToUniversalPath(filepath.Join(path, "collMod_indexUniqueness"))
-	dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
-	oplogFilePath := util.ToUniversalPath(filepath.Join(dumpDir, "oplog.bson"))
+	dumpDir := filepath.FromSlash(filepath.Join(path, "collMod_indexUniqueness"))
+	dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
+	oplogFilePath := filepath.FromSlash(filepath.Join(dumpDir, "oplog.bson"))
 	require.True(t, fileDirExists(dumpDir))
 	require.True(t, fileDirExists(dumpDBDir))
 	require.True(t, fileDirExists(oplogFilePath))
@@ -229,8 +284,8 @@ func TestOplogDumpCollModIndexUniqueness(t *testing.T) {
 	require.Equal(t, 4, forceNonUniqueCount)
 }
 
-func createIndexesAndCollModIndexUniqueness(ctx context.Context) error {
-	client, err := testutil.GetBareSession()
+func createIndexesAndCollModIndexUniqueness(t *testing.T, ctx context.Context) error {
+	client, err := testutil.GetBareSession(t)
 	if err != nil {
 		return err
 	}
@@ -309,7 +364,7 @@ func TestOplogDumpBypassDocumentValidation(t *testing.T) {
 
 	ctx := t.Context()
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("Failed to get session: %v", err)
 	}
@@ -329,25 +384,31 @@ func TestOplogDumpBypassDocumentValidation(t *testing.T) {
 
 	require.NoError(t, md.Init())
 
-	// Enable a failpoint so that the test can create oplogs during dump.
-	failpoint.ParseFailpoints(failpoint.PauseBeforeDumping)
-	defer failpoint.Reset()
-
-	go func() {
-		createCollectionWithValidatorAndInsertBypassValidation(ctx, t)
-	}()
+	// Pause mongodump right after it captures the oplog start time so that the
+	// test can create oplog entries during the dump window, then let it resume.
+	require.NoError(t, failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()))
+	defer failpoint.DefaultManager.Reset()
 
 	//nolint:errcheck
 	defer tearDownMongoDumpTestData(t)
 
-	require.NoError(t, md.Dump())
+	dumpErrCh := make(chan error, 1)
+	go func() { dumpErrCh <- md.Dump() }()
+
+	fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+	require.True(t, ok, "PauseUntilResumed failpoint should be enabled")
+	require.NoError(t, fp.Reached(context.TODO()))
+	createCollectionWithValidatorAndInsertBypassValidation(ctx, t)
+	fp.Signal()
+
+	require.NoError(t, <-dumpErrCh)
 
 	path, err := os.Getwd()
 	require.NoError(t, err)
 
-	dumpDir := util.ToUniversalPath(filepath.Join(path, "oplog_bypassDocumentValidation"))
-	dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
-	oplogFilePath := util.ToUniversalPath(filepath.Join(dumpDir, "oplog.bson"))
+	dumpDir := filepath.FromSlash(filepath.Join(path, "oplog_bypassDocumentValidation"))
+	dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
+	oplogFilePath := filepath.FromSlash(filepath.Join(dumpDir, "oplog.bson"))
 	require.True(t, fileDirExists(dumpDir))
 	require.True(t, fileDirExists(dumpDBDir))
 	require.True(t, fileDirExists(oplogFilePath))
@@ -385,7 +446,7 @@ func TestOplogDumpBypassDocumentValidation(t *testing.T) {
 }
 
 func createCollectionWithValidatorAndInsertBypassValidation(ctx context.Context, t *testing.T) {
-	client, err := testutil.GetBareSession()
+	client, err := testutil.GetBareSession(t)
 	require.NoError(t, err)
 
 	testCollName := testCollectionNames[0]
@@ -443,7 +504,7 @@ func TestOplogDumpCollModTTL(t *testing.T) {
 
 	ctx := t.Context()
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	require.NoError(t, err)
 
 	testCollName := testCollectionNames[0]
@@ -479,25 +540,31 @@ func TestOplogDumpCollModTTL(t *testing.T) {
 
 	require.NoError(t, md.Init())
 
-	// Enable a failpoint so that the test can create oplogs during dump.
-	failpoint.ParseFailpoints(failpoint.PauseBeforeDumping)
-	defer failpoint.Reset()
-
-	go func() {
-		convertIndexToTTL(ctx, t)
-	}()
+	// Pause mongodump right after it captures the oplog start time so that the
+	// test can create oplog entries during the dump window, then let it resume.
+	require.NoError(t, failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()))
+	defer failpoint.DefaultManager.Reset()
 
 	//nolint:errcheck
 	defer tearDownMongoDumpTestData(t)
 
-	require.NoError(t, md.Dump())
+	dumpErrCh := make(chan error, 1)
+	go func() { dumpErrCh <- md.Dump() }()
+
+	fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+	require.True(t, ok, "PauseUntilResumed failpoint should be enabled")
+	require.NoError(t, fp.Reached(context.TODO()))
+	convertIndexToTTL(ctx, t)
+	fp.Signal()
+
+	require.NoError(t, <-dumpErrCh)
 
 	path, err := os.Getwd()
 	require.NoError(t, err)
 
-	dumpDir := util.ToUniversalPath(filepath.Join(path, md.OutputOptions.Out))
-	dumpDBDir := util.ToUniversalPath(filepath.Join(dumpDir, testDB))
-	oplogFilePath := util.ToUniversalPath(filepath.Join(dumpDir, "oplog.bson"))
+	dumpDir := filepath.FromSlash(filepath.Join(path, md.OutputOptions.Out))
+	dumpDBDir := filepath.FromSlash(filepath.Join(dumpDir, testDB))
+	oplogFilePath := filepath.FromSlash(filepath.Join(dumpDir, "oplog.bson"))
 	require.True(t, fileDirExists(dumpDir))
 	require.True(t, fileDirExists(dumpDBDir))
 	require.True(t, fileDirExists(oplogFilePath))
@@ -529,7 +596,7 @@ func TestOplogDumpCollModTTL(t *testing.T) {
 }
 
 func convertIndexToTTL(ctx context.Context, t *testing.T) {
-	client, err := testutil.GetBareSession()
+	client, err := testutil.GetBareSession(t)
 	require.NoError(t, err)
 
 	testCollName := testCollectionNames[0]
@@ -545,4 +612,327 @@ func convertIndexToTTL(ctx context.Context, t *testing.T) {
 		},
 	)
 	require.NoError(t, res.Err())
+}
+
+// TestOplogRollover verifies that mongodump refuses to produce a dump when
+// the oplog has rolled over during dumping and evicted the entry it captured
+// its starting timestamp from.
+//
+// jstests/dump/oplog_rollover_test.js used to test this by racing a fixed
+// 15-second sleep against a fixed amount of write load meant to overflow a
+// deliberately tiny (2MB) oplog, and needed several rounds of "make this
+// less racy" fixes over the years as host speed varied. That approach isn't
+// available here anyway: the shared replica set used by Go integration
+// tests can't be resized below 990MB (server-enforced), and forcing genuine
+// eviction against that cluster turned out to depend on WiredTiger
+// checkpoint/oldest-timestamp scheduling in ways that were empirically
+// unpredictable even when forcing checkpoints and using majority write
+// concern.
+//
+// Instead, this uses the PauseUntilResumed failpoint to block mongodump
+// after it has captured its real starting timestamp, overwrites that
+// timestamp with one guaranteed not to exist in the oplog, and resumes.
+// mongodump then runs the exact same overflow-detection logic
+// (checkOplogTimestampExists, in oplog_dump.go) it would in production,
+// deterministically and without needing to write any data at all.
+func TestOplogRollover(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	// Oplog is not available in a standalone topology.
+	testtype.SkipUnlessTestType(t, testtype.ReplSetTestType)
+
+	md, err := simpleMongoDumpInstance()
+	require.NoError(t, err)
+
+	md.ToolOptions.DB = ""
+	md.OutputOptions.Oplog = true
+	md.OutputOptions.Out = "oplog_rollover"
+	require.NoError(t, md.Init())
+	defer os.RemoveAll(md.OutputOptions.Out)
+
+	require.NoError(t, failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()))
+	defer failpoint.DefaultManager.Reset()
+
+	dumpErrCh := make(chan error, 1)
+	go func() {
+		dumpErrCh <- md.Dump()
+	}()
+
+	fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+	require.True(t, ok, "PauseUntilResumed failpoint should be enabled")
+	require.NoError(t, fp.Reached(context.TODO()))
+	md.oplogStart = bson.Timestamp{T: 1, I: 1}
+	fp.Signal()
+
+	err = <-dumpErrCh
+	require.ErrorContains(
+		t,
+		err,
+		"oplog overflow: mongodump was unable to capture all new oplog entries during execution",
+		"mongodump should crash when the oplog rolls over during dumping",
+	)
+}
+
+// TestOplogCheckSurvivesCappedPositionLost verifies that a CappedPositionLost
+// error while reading the oldest oplog entry is retried, rather than being
+// reported as an oplog overflow.
+//
+// Reading the front of the oplog in $natural order races the server's oplog
+// truncation, so on a busy oplog the read can fail with CappedPositionLost
+// (TOOLS-4338). That used to surface as "oplog overflow", which wrongly told
+// users the dump may have lost oplog entries. The FailOplogCheckRead failpoint
+// injects that error once so the retry can be tested without having to race
+// real truncation.
+func TestOplogCheckSurvivesCappedPositionLost(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	// Oplog is not available in a standalone topology.
+	testtype.SkipUnlessTestType(t, testtype.ReplSetTestType)
+
+	md, err := simpleMongoDumpInstance()
+	require.NoError(t, err)
+
+	md.ToolOptions.DB = ""
+	md.OutputOptions.Oplog = true
+	md.OutputOptions.Out = "oplog_capped_position_lost"
+	require.NoError(t, md.Init())
+	defer os.RemoveAll(md.OutputOptions.Out)
+
+	require.NoError(t, failpoint.DefaultManager.Parse(failpoint.FailOplogCheckRead.String()))
+	defer failpoint.DefaultManager.Reset()
+
+	fp, ok := failpoint.DefaultManager.Get(failpoint.FailOplogCheckRead)
+	require.True(t, ok, "FailOplogCheckRead failpoint should be enabled")
+
+	var injectOnce sync.Once
+	var injected atomic.Int64
+	fp.SetErrorFunc(func() error {
+		var err error
+		injectOnce.Do(func() {
+			injected.Add(1)
+			err = cappedPositionLostError()
+		})
+		return err
+	})
+
+	require.NoError(
+		t,
+		md.Dump(),
+		"mongodump should retry a lost oplog read instead of reporting an overflow",
+	)
+
+	require.EqualValues(
+		t,
+		1,
+		injected.Load(),
+		"the injected error fired during the dump, so the retry was really exercised",
+	)
+
+	oplogInfo, err := os.Stat(filepath.Join(md.OutputOptions.Out, "oplog.bson"))
+	require.NoError(t, err, "the retried dump should still have written an oplog")
+	require.NotZero(t, oplogInfo.Size(), "the dumped oplog should not be empty")
+}
+
+// TestOplogCheckReportsPersistentReadError verifies that when the oldest-entry
+// read keeps failing, mongodump reports that read error rather than claiming an
+// oplog overflow. The overflow message tells users the dump may have lost oplog
+// entries, which is a very different thing from the check itself being unable to
+// read (TOOLS-4338).
+func TestOplogCheckReportsPersistentReadError(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	// Oplog is not available in a standalone topology.
+	testtype.SkipUnlessTestType(t, testtype.ReplSetTestType)
+
+	md, err := simpleMongoDumpInstance()
+	require.NoError(t, err)
+
+	md.ToolOptions.DB = ""
+	md.OutputOptions.Oplog = true
+	md.OutputOptions.Out = "oplog_persistent_read_error"
+	require.NoError(t, md.Init())
+	defer os.RemoveAll(md.OutputOptions.Out)
+
+	require.NoError(t, failpoint.DefaultManager.Parse(failpoint.FailOplogCheckRead.String()))
+	defer failpoint.DefaultManager.Reset()
+
+	fp, ok := failpoint.DefaultManager.Get(failpoint.FailOplogCheckRead)
+	require.True(t, ok, "FailOplogCheckRead failpoint should be enabled")
+
+	fp.SetErrorFunc(cappedPositionLostError)
+
+	err = md.Dump()
+	require.ErrorContains(
+		t,
+		err,
+		"unable to check oplog for overflow",
+		"a read that never succeeds is reported as a failed check",
+	)
+	require.NotContains(
+		t,
+		err.Error(),
+		"oplog overflow:",
+		"a failed check is not reported as an oplog overflow",
+	)
+}
+
+func cappedPositionLostError() error {
+	return mongo.CommandError{
+		Code: cappedPositionLostErrCode,
+		Name: "CappedPositionLost",
+		Message: "CollectionScan died due to position in capped collection being deleted" +
+			" (injected by the FailOplogCheckRead failpoint)",
+	}
+}
+
+// TestOplogDumpRejectsRename checks that an `--oplog` dump fails when a collection is renamed while
+// it runs. A rename is not replayable against a dump taken around it, so the resulting oplog would
+// not restore.
+func TestOplogDumpRejectsRename(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	// Oplog is not available in a standalone topology.
+	testtype.SkipUnlessTestType(t, testtype.ReplSetTestType)
+
+	const (
+		dbName   = "oplog_rename_test"
+		fromColl = "bar1"
+		toColl   = "bar2"
+	)
+
+	client, err := testutil.GetBareSession(t)
+	require.NoError(t, err)
+
+	renameDB := client.Database(dbName)
+	t.Cleanup(func() {
+		require.NoError(t, renameDB.Drop(context.Background()), "dropping the test database")
+	})
+	_, err = renameDB.Collection(fromColl).InsertOne(context.Background(), bson.D{{"x", 1}})
+	require.NoError(t, err, "seeding the collection that gets renamed")
+
+	err = dumpWithOplogWhilePaused(t, func() {
+		res := client.Database("admin").RunCommand(context.Background(), bson.D{
+			{"renameCollection", dbName + "." + fromColl},
+			{"to", dbName + "." + toColl},
+		})
+		require.NoError(t, res.Err(), "renaming the collection while the dump is paused")
+	})
+	require.ErrorContains(
+		t,
+		err,
+		"cannot dump with oplog while renames occur",
+		"a rename inside the dump's oplog window fails the dump",
+	)
+}
+
+// TestOplogDumpRejectsAdminSystemVersionChange checks that an `--oplog` dump fails when
+// admin.system.version is written while it runs. That collection holds the FCV document, so a
+// change to it mid-dump means the dump spans two different server feature sets and the oplog cannot
+// be replayed as one unit.
+func TestOplogDumpRejectsAdminSystemVersionChange(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	// Oplog is not available in a standalone topology.
+	testtype.SkipUnlessTestType(t, testtype.ReplSetTestType)
+
+	client, err := testutil.GetBareSession(t)
+	require.NoError(t, err)
+
+	// The real FCV document lives here, so this writes and removes a document of its own rather
+	// than touching anything the server put there.
+	systemVersion := client.Database("admin").Collection("system.version")
+	const dummyID = "mongodump-oplog-test"
+	t.Cleanup(func() {
+		_, err := systemVersion.DeleteOne(context.Background(), bson.D{{"_id", dummyID}})
+		require.NoError(t, err, "removing the dummy system.version document")
+	})
+
+	err = dumpWithOplogWhilePaused(t, func() {
+		_, err := systemVersion.InsertOne(
+			context.Background(),
+			bson.D{{"_id", dummyID}, {"dummy", true}},
+		)
+		require.NoError(t, err, "writing to admin.system.version while the dump is paused")
+	})
+	require.ErrorContains(
+		t,
+		err,
+		"cannot dump with oplog if admin.system.version is modified",
+		"a write to admin.system.version inside the dump's oplog window fails the dump",
+	)
+}
+
+// TestOplogDumpFailsOnStandalone checks that `--oplog` against a standalone fails before writing
+// anything. A standalone keeps no oplog, so there is nothing for mongodump to capture and no
+// point-in-time dump it can produce.
+func TestOplogDumpFailsOnStandalone(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testutil.SkipUnlessStandalone(t)
+
+	md, err := simpleMongoDumpInstance()
+	require.NoError(t, err)
+
+	md.ToolOptions.DB = ""
+	md.OutputOptions.Oplog = true
+	md.OutputOptions.Out = t.TempDir()
+	require.NoError(t, md.Init())
+
+	err = md.Dump()
+	require.ErrorContains(
+		t, err, "error getting oplog start",
+		"an --oplog dump of a server with no oplog fails",
+	)
+
+	entries, err := os.ReadDir(md.OutputOptions.Out)
+	require.NoError(t, err, "can read the dump directory")
+	assert.Empty(t, entries, "the failed dump wrote nothing")
+}
+
+// TestOplogDumpFailsOnSharded checks that `--oplog` against a sharded cluster fails. Mongodump does
+// not support oplog dump with sharded clusters.
+func TestOplogDumpFailsOnSharded(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.ShardedIntegrationTestType)
+
+	md, err := simpleMongoDumpInstance()
+	require.NoError(t, err)
+
+	md.ToolOptions.DB = ""
+	md.OutputOptions.Oplog = true
+	md.OutputOptions.Out = t.TempDir()
+	err = md.Init()
+	require.ErrorContains(
+		t, err, "can't use --oplog option when dumping from a mongos",
+		"an --oplog dump of a sharded cluster fails",
+	)
+
+	entries, err := os.ReadDir(md.OutputOptions.Out)
+	require.NoError(t, err, "can read the dump directory")
+	assert.Empty(t, entries, "the failed dump wrote nothing")
+}
+
+// dumpWithOplogWhilePaused runs a whole-cluster --oplog dump, pausing it after it
+// has captured its starting oplog timestamp so that whatever modify does is
+// guaranteed to land inside the dump's oplog window. It returns the dump's error.
+func dumpWithOplogWhilePaused(t *testing.T, modify func()) error {
+	t.Helper()
+
+	md, err := simpleMongoDumpInstance()
+	require.NoError(t, err)
+
+	md.ToolOptions.DB = ""
+	md.OutputOptions.Oplog = true
+	md.OutputOptions.Out = t.TempDir()
+	require.NoError(t, md.Init())
+
+	require.NoError(t, failpoint.DefaultManager.Parse(failpoint.PauseUntilResumed.String()))
+	defer failpoint.DefaultManager.Reset()
+
+	dumpErrCh := make(chan error, 1)
+	go func() {
+		dumpErrCh <- md.Dump()
+	}()
+
+	fp, ok := failpoint.DefaultManager.Get(failpoint.PauseUntilResumed)
+	require.True(t, ok, "the PauseUntilResumed failpoint is enabled")
+	require.NoError(t, fp.Reached(context.TODO()), "the dump reaches the pause")
+
+	modify()
+	fp.Signal()
+
+	return <-dumpErrCh
 }

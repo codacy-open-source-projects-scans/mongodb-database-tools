@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/craiggwilson/goke/pkg/git"
@@ -28,9 +29,14 @@ var pkgNames = []string{
 	"mongostat", "mongotop",
 	"mongofiles",
 	"common",
+	"evergreen",
 	"release",
 	"integration",
 }
+
+// Packages that hold library or tooling code rather than a tool, so there is no
+// binary to build for them.
+var nonToolPkgs = []string{"common", "evergreen", "release", "integration"}
 
 func getMinimumGoVersion(ctx *task.Context) (string, error) {
 	root, err := repoRoot()
@@ -97,7 +103,7 @@ func CheckMinimumGoVersion(ctx *task.Context) error {
 // BuildTools is an Executor that builds the tools.
 func BuildTools(ctx *task.Context) error {
 	for _, pkg := range selectedPkgs(ctx) {
-		if pkg != "common" && pkg != "release" && pkg != "integration" {
+		if !slices.Contains(nonToolPkgs, pkg) {
 			err := buildToolBinary(ctx, pkg, "bin")
 			if err != nil {
 				return err
@@ -120,6 +126,18 @@ func TestKerberos(ctx *task.Context) error {
 // TestIntegration is an Executor that runs all integration tests for the provided packages.
 func TestIntegration(ctx *task.Context) error {
 	return runTests(ctx, selectedPkgs(ctx), testtype.IntegrationTestType)
+}
+
+// TestCrossCluster runs the dump/restore and export/import round-trip tests across two clusters. It
+// targets the dumprestore and exportimport packages, and the second cluster is enabled by the
+// TOOLS_TESTING_MONGOD2 env var that the CI task stands up. When that var is set, the routed
+// round-trip tests run in both orientations; when not, they run single-cluster against the primary.
+func TestCrossCluster(ctx *task.Context) error {
+	return runTests(
+		ctx,
+		[]string{"integration/dumprestore", "integration/exportimport"},
+		testtype.IntegrationTestType,
+	)
 }
 
 // TestShardedIntegration runs tests that require a sharded cluster (mongos) topology.

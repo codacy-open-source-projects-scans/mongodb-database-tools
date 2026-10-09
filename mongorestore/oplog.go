@@ -8,6 +8,7 @@ package mongorestore
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -25,7 +26,6 @@ import (
 	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"golang.org/x/exp/slices"
 )
 
 type oplogContext struct {
@@ -56,6 +56,27 @@ var knownCommands = mapset.NewSet(
 )
 
 var errorTimestampBeforeLimit = fmt.Errorf("timestamp before limit")
+
+// upgradeDowngradeViewlessTimeseriesCmd is emitted by setFCV on 9.0+ deployments when a
+// timeseries collection is converted between its viewful and viewless forms. See SERVER-114505.
+const upgradeDowngradeViewlessTimeseriesCmd = "upgradeDowngradeViewlessTimeseries"
+
+// The conversion cannot be replayed: applying it requires the collection UUID, which mongorestore
+// strips unless --preserveUUID is set, and skipping it would leave the target collection in a form
+// that does not match the namespaces used by the oplog entries after the conversion. Rather than
+// silently producing a collection in an inconsistent state, we fail with a specific diagnostic.
+func newViewlessTimeseriesConversionError(op db.Oplog) error {
+	return fmt.Errorf(
+		"oplog entry %#q at %v cannot be replayed: this oplog window crosses a "+
+			"timeseries format conversion caused by an FCV change between 8.x and 9.0. "+
+			"Replaying across such a conversion is not supported. Restore an oplog range "+
+			"that does not span the FCV change, using --oplogLimit to stop before it if "+
+			"needed: %v",
+		upgradeDowngradeViewlessTimeseriesCmd,
+		op.Timestamp,
+		op,
+	)
+}
 
 // shouldIgnoreNamespace returns true if the given namespace should be ignored during applyOps.
 func shouldIgnoreNamespace(ns string) bool {
@@ -170,6 +191,11 @@ var ignoredCEntries = mapset.NewSet(
 	"startIndexBuild",
 	"abortIndexBuild",
 	"setMultikeyMetadata",
+	// The second phase of a replicated table drop (SERVER-118737). Its payload is a storage
+	// engine ident name that only means anything on the node that produced it, so it must be
+	// skipped rather than forwarded to the restore target. The logical drop is already carried
+	// by the first-phase drop/dropIndexes entry, which we do apply.
+	"dropIdent",
 )
 
 func (restore *MongoRestore) HandleOp(oplogCtx *oplogContext, op db.Oplog) error {
@@ -235,6 +261,10 @@ func (restore *MongoRestore) HandleNonTxnOp(oplogCtx *oplogContext, op db.Oplog)
 		}
 		cmdName := op.Object[0].Key
 
+		if cmdName == upgradeDowngradeViewlessTimeseriesCmd {
+			return newViewlessTimeseriesConversionError(op)
+		}
+
 		if !knownCommands.ContainsOne(cmdName) {
 			return fmt.Errorf("unknown oplog command name %v: %v", cmdName, op)
 		}
@@ -253,10 +283,6 @@ func (restore *MongoRestore) HandleNonTxnOp(oplogCtx *oplogContext, op db.Oplog)
 					collectionName,
 					op,
 				)
-			}
-
-			if restore.OutputOptions.ConvertLegacyIndexes {
-				indexes = restore.convertLegacyIndexes(indexes, op.Namespace)
 			}
 
 			collName, ok := op.Object[0].Value.(string)
@@ -279,10 +305,6 @@ func (restore *MongoRestore) HandleNonTxnOp(oplogCtx *oplogContext, op db.Oplog)
 			}
 
 			indexes := []*idx.IndexDocument{index}
-			if restore.OutputOptions.ConvertLegacyIndexes {
-				indexes = restore.convertLegacyIndexes(indexes, op.Namespace)
-			}
-
 			collName, ok := op.Object[0].Value.(string)
 			if !ok {
 				return fmt.Errorf("could not parse collection name from op: %v", op)
@@ -336,11 +358,6 @@ func (restore *MongoRestore) HandleNonTxnOp(oplogCtx *oplogContext, op db.Oplog)
 			}
 			return nil
 		case "collMod":
-			if restore.serverVersion.GTE(db.Version{4, 1, 11}) {
-				_, _ = bsonutil.RemoveKey("noPadding", &op.Object)
-				_, _ = bsonutil.RemoveKey("usePowerOf2Sizes", &op.Object)
-			}
-
 			indexModValue, found := bsonutil.RemoveKey("index", &op.Object)
 			if !found {
 				break
@@ -455,7 +472,10 @@ func (restore *MongoRestore) ApplyOp(session *mongo.Client, op db.Oplog) error {
 		},
 	)
 	if err := singleRes.Err(); err != nil {
-		return fmt.Errorf("applyOps: %v", err)
+		return fmt.Errorf(
+			"applyOps (note that --oplogReplay and --preserveUUID are not supported with sharded or disaggregated storage clusters): %v",
+			err,
+		)
 	}
 	res := bson.M{}
 	if err := singleRes.Decode(&res); err != nil {
@@ -523,30 +543,11 @@ func ParseTimestampFlag(ts string) (bson.Timestamp, error) {
 	return bson.Timestamp{T: secsU32, I: incU32}, nil
 }
 
-// Server versions 3.6.0-3.6.8 and 4.0.0-4.0.2 require a 'ui' field
-// in the createIndexes command.
-func (restore *MongoRestore) needsCreateIndexWorkaround() bool {
-	sv := restore.serverVersion
-	if (sv.GTE(db.Version{3, 6, 0}) && sv.LTE(db.Version{3, 6, 8})) ||
-		(sv.GTE(db.Version{4, 0, 0}) && sv.LTE(db.Version{4, 0, 2})) {
-		return true
-	}
-	return false
-}
-
 // filterUUIDs removes 'ui' entries from ops, including nested applyOps ops.
-// It also modifies ops that rely on 'ui'.
 func (restore *MongoRestore) filterUUIDs(op db.Oplog) (db.Oplog, error) {
 	// Remove UUIDs from oplog entries
 	if !restore.OutputOptions.PreserveUUID {
 		op.UI = nil
-
-		// The createIndexes oplog command requires 'ui' for some server versions, so
-		// in that case we fall back to an old-style system.indexes insert.
-		if op.Operation == "c" && op.Object[0].Key == "createIndexes" &&
-			restore.needsCreateIndexWorkaround() {
-			return convertCreateIndexToIndexInsert(op)
-		}
 	}
 
 	// Check for and filter nested applyOps ops
@@ -572,34 +573,6 @@ func (restore *MongoRestore) filterRecordIdsReplicated(op db.Oplog) db.Oplog {
 	}
 
 	return op
-}
-
-// convertCreateIndexToIndexInsert converts from new-style create indexes
-// command to old style special index insert.
-func convertCreateIndexToIndexInsert(op db.Oplog) (db.Oplog, error) {
-	dbName, _ := util.SplitNamespace(op.Namespace)
-
-	cmdValue := op.Object[0].Value
-	collName, ok := cmdValue.(string)
-	if !ok {
-		return db.Oplog{}, fmt.Errorf("unknown format for createIndexes")
-	}
-
-	indexSpec := op.Object[1:]
-	if len(indexSpec) < 3 {
-		return db.Oplog{}, fmt.Errorf("unknown format for createIndexes, index spec " +
-			"must have at least \"v\", \"key\", and \"name\" fields")
-	}
-
-	// createIndexes does not include the "ns" field but index inserts
-	// do. Add it as the third field, after "v", "key", and "name".
-	ns := bson.D{{"ns", fmt.Sprintf("%s.%s", dbName, collName)}}
-	indexSpec = append(indexSpec[:3], append(ns, indexSpec[3:]...)...)
-	op.Object = indexSpec
-	op.Namespace = fmt.Sprintf("%s.system.indexes", dbName)
-	op.Operation = "i"
-
-	return op, nil
 }
 
 // extractIndexDocumentFromCommitIndexBuilds extracts the index specs out of  "commitIndexBuild" oplog entry and convert to IndexDocument

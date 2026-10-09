@@ -23,6 +23,7 @@ import (
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
+	"github.com/mongodb/mongo-tools/common/testopts"
 	"github.com/mongodb/mongo-tools/common/testtype"
 	"github.com/mongodb/mongo-tools/common/testutil"
 	"github.com/mongodb/mongo-tools/common/wcwrapper"
@@ -31,6 +32,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	mopt "go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/xoptions"
 )
 
 const (
@@ -59,7 +62,7 @@ func init() {
 }
 
 func getRestoreWithArgs(additionalArgs ...string) (*MongoRestore, error) {
-	opts, err := ParseOptions(append(testutil.GetBareArgs(), additionalArgs...), "", "")
+	opts, err := ParseOptions(append(testopts.GetBareArgs(), additionalArgs...), "", "")
 	if err != nil {
 		return nil, fmt.Errorf("error parsing args: %v", err)
 	}
@@ -139,7 +142,7 @@ func TestMongorestore(t *testing.T) {
 		testtype.ShardedIntegrationTestType,
 	)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -282,7 +285,7 @@ func TestMongoRestoreSpecialCharactersCollectionNames(t *testing.T) {
 		testtype.ShardedIntegrationTestType,
 	)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -390,7 +393,7 @@ func TestMongorestoreLongCollectionName(t *testing.T) {
 
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -506,7 +509,11 @@ func TestMongorestoreLongCollectionName(t *testing.T) {
 
 func TestMongorestorePreserveUUID(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
-	session, err := testutil.GetBareSession()
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it restores with --preserveUUID, which mongorestore implements via applyOps, and DSC does not support that command",
+	)
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -665,7 +672,7 @@ func TestMongorestoreMIOSOE(t *testing.T) {
 		t.Fatalf("Couldn't generate test data %v", err)
 	}
 
-	client, err := testutil.GetBareSession()
+	client, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -741,7 +748,7 @@ func TestMongorestoreMIOSOE(t *testing.T) {
 
 func TestDeprecatedIndexOptions(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -781,137 +788,13 @@ func TestDeprecatedIndexOptions(t *testing.T) {
 			So(err, ShouldBeNil)
 			So(count, ShouldEqual, 100)
 		})
-
-		err = coll.Drop(t.Context())
-		So(err, ShouldBeNil)
-
-		args = []string{
-			NumParallelCollectionsOption, "1",
-			NumInsertionWorkersOption, "1",
-			ConvertLegacyIndexesOption, "true",
-		}
-
-		restore, err = getRestoreWithArgs(args...)
-		So(err, ShouldBeNil)
-		defer restore.Close()
-
-		Convey(
-			"Creating index with invalid option and --convertLegacyIndexes should succeed",
-			func() {
-				restore.TargetDirectory = "testdata/indextestdump"
-				result := restore.Restore()
-				So(result.Err, ShouldBeNil)
-
-				So(result.Successes, ShouldEqual, 100)
-				So(result.Failures, ShouldEqual, 0)
-				count, err := coll.CountDocuments(t.Context(), bson.M{})
-				So(err, ShouldBeNil)
-				So(count, ShouldEqual, 100)
-			},
-		)
-	})
-}
-
-// TestFixDuplicatedLegacyIndexes restores two indexes with --convertLegacyIndexes flag, {foo: ""} and {foo: 1}
-// Only one index {foo: 1} should be created.
-func TestFixDuplicatedLegacyIndexes(t *testing.T) {
-	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
-
-	session, err := testutil.GetBareSession()
-	if err != nil {
-		t.Fatalf("No server available")
-	}
-
-	fcv := testutil.GetFCV(session)
-	if cmp, err := testutil.CompareFCV(fcv, "3.4"); err != nil || cmp < 0 {
-		t.Skip("Requires server with FCV 3.4 or later")
-	}
-	Convey("With a test MongoRestore", t, func() {
-		args := []string{
-			ConvertLegacyIndexesOption,
-		}
-
-		restore, err := getRestoreWithArgs(args...)
-		So(err, ShouldBeNil)
-		defer restore.Close()
-
-		Convey("Index with duplicate key after convertLegacyIndexes should be skipped", func() {
-			restore.TargetDirectory = "testdata/duplicate_index_key"
-			result := restore.Restore()
-			So(result.Err, ShouldBeNil)
-			So(result.Successes, ShouldEqual, 0)
-			So(result.Failures, ShouldEqual, 0)
-			So(err, ShouldBeNil)
-
-			testDB := session.Database("indextest")
-			defer func() {
-				err = testDB.Drop(t.Context())
-				if err != nil {
-					t.Fatalf("Failed to drop test database testdata")
-				}
-			}()
-
-			c, err := testDB.Collection("duplicate_index_key").Indexes().List(t.Context())
-			So(err, ShouldBeNil)
-
-			type indexRes struct {
-				Name string
-				Key  bson.D
-			}
-
-			indexKeys := make(map[string]bson.D)
-
-			// two Indexes should be created in addition to the _id, foo and foo_2
-			for c.Next(t.Context()) {
-				var res indexRes
-				err = c.Decode(&res)
-				So(err, ShouldBeNil)
-				So(len(res.Key), ShouldEqual, 1)
-				indexKeys[res.Name] = res.Key
-			}
-
-			So(len(indexKeys), ShouldEqual, 3)
-
-			var indexKey bson.D
-			// Check that only one of foo_, foo_1, or foo_1.0 was created
-			indexKeyFoo, ok := indexKeys["foo_"]
-			indexKeyFoo1, ok1 := indexKeys["foo_1"]
-			indexKeyFoo10, ok10 := indexKeys["foo_1.0"]
-
-			So(ok || ok1 || ok10, ShouldBeTrue)
-
-			if ok {
-				So(ok1 || ok10, ShouldBeFalse)
-				indexKey = indexKeyFoo
-			}
-
-			if ok1 {
-				So(ok || ok10, ShouldBeFalse)
-				indexKey = indexKeyFoo1
-			}
-
-			if ok10 {
-				So(ok || ok1, ShouldBeFalse)
-				indexKey = indexKeyFoo10
-			}
-
-			So(len(indexKey), ShouldEqual, 1)
-			So(indexKey[0].Key, ShouldEqual, "foo")
-			So(indexKey[0].Value, ShouldEqual, 1)
-
-			indexKey, ok = indexKeys["foo_2"]
-			So(ok, ShouldBeTrue)
-			So(len(indexKey), ShouldEqual, 1)
-			So(indexKey[0].Key, ShouldEqual, "foo")
-			So(indexKey[0].Value, ShouldEqual, 2)
-		})
 	})
 }
 
 func TestDeprecatedIndexOptionsOn44FCV(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -943,17 +826,7 @@ func TestDeprecatedIndexOptionsOn44FCV(t *testing.T) {
 			So(dropErr, ShouldBeNil)
 		}()
 
-		args = []string{
-			NumParallelCollectionsOption, "1",
-			NumInsertionWorkersOption, "1",
-			ConvertLegacyIndexesOption, "true",
-		}
-
-		restore, err = getRestoreWithArgs(args...)
-		So(err, ShouldBeNil)
-		defer restore.Close()
-
-		Convey("Creating index with --convertLegacyIndexes and 4.4 FCV should succeed", func() {
+		Convey("Creating index with 4.4 FCV should succeed", func() {
 			restore.TargetDirectory = "testdata/indexmetadata"
 			result := restore.Restore()
 			So(result.Err, ShouldBeNil)
@@ -991,27 +864,16 @@ func TestLongIndexName(t *testing.T) {
 			So(dropErr, ShouldBeNil)
 		}()
 
-		if restore.serverVersion.LT(db.Version{4, 2, 0}) {
-			Convey(
-				"Creating index with a full name longer than 127 bytes should fail (<4.2)",
-				func() {
-					restore.TargetDirectory = "testdata/longindextestdump"
-					result := restore.Restore()
-					So(result.Err, ShouldNotBeNil)
-					So(
-						result.Err.Error(),
-						ShouldContainSubstring,
-						"namespace is too long (max size is 127 bytes)",
-					)
-				},
-			)
-		} else {
-			Convey("Creating index with a full name longer than 127 bytes should succeed (>=4.2)", func() {
+		Convey(
+			"Creating index with a full name longer than 127 bytes should succeed",
+			func() {
 				restore.TargetDirectory = "testdata/longindextestdump"
 				result := restore.Restore()
 				So(result.Err, ShouldBeNil)
 
-				indexes := session.Database("longindextest").Collection("test_collection").Indexes()
+				indexes := session.Database("longindextest").
+					Collection("test_collection").
+					Indexes()
 				c, err := indexes.List(t.Context())
 				So(err, ShouldBeNil)
 
@@ -1028,9 +890,13 @@ func TestLongIndexName(t *testing.T) {
 				So(len(names), ShouldEqual, 2)
 				sort.Strings(names)
 				So(names[0], ShouldEqual, "_id_")
-				So(names[1], ShouldEqual, "a_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
-			})
-		}
+				So(
+					names[1],
+					ShouldEqual,
+					"a_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+				)
+			},
+		)
 
 	})
 }
@@ -1041,7 +907,7 @@ func TestKnownCollections(t *testing.T) {
 		testtype.IntegrationTestType,
 		testtype.ShardedIntegrationTestType,
 	)
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -1086,7 +952,7 @@ func TestKnownCollections(t *testing.T) {
 
 func TestReadPreludeMetadata(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -1183,9 +1049,9 @@ func TestReadPreludeMetadata(t *testing.T) {
 	})
 }
 
-func TestFixHashedIndexes(t *testing.T) {
+func TestHashedIndexes(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -1194,54 +1060,7 @@ func TestFixHashedIndexes(t *testing.T) {
 		Key bson.D
 	}
 
-	Convey("Test MongoRestore with hashed indexes and --fixHashedIndexes", t, func() {
-		args := []string{
-			FixDottedHashedIndexesOption,
-		}
-
-		restore, err := getRestoreWithArgs(args...)
-		So(err, ShouldBeNil)
-		defer restore.Close()
-
-		db := session.Database("testdata")
-
-		defer func() {
-			dropErr := db.Collection("hashedIndexes").Drop(t.Context())
-			So(dropErr, ShouldBeNil)
-		}()
-
-		Convey(
-			"The index for a.b should be changed from 'hashed' to 1, since it is dotted",
-			func() {
-				restore.TargetDirectory = "testdata/hashedIndexes.bson"
-				result := restore.Restore()
-				So(result.Err, ShouldBeNil)
-
-				indexes := db.Collection("hashedIndexes").Indexes()
-				c, err := indexes.List(t.Context())
-				So(err, ShouldBeNil)
-				var res indexRes
-
-				for c.Next(t.Context()) {
-					err := c.Decode(&res)
-					So(err, ShouldBeNil)
-					for _, key := range res.Key {
-						if key.Key == "b" {
-							So(key.Value, ShouldEqual, "hashed")
-						} else if key.Key == "a.a" {
-							So(key.Value, ShouldEqual, 1)
-						} else if key.Key == "a.b" {
-							So(key.Value, ShouldEqual, 1)
-						} else if key.Key != "_id" {
-							t.Fatalf("Unexepected Index: %v", key.Key)
-						}
-					}
-				}
-			},
-		)
-	})
-
-	Convey("Test MongoRestore with hashed indexes without --fixHashedIndexes", t, func() {
+	Convey("Test MongoRestore with hashed indexes", t, func() {
 		args := []string{}
 
 		restore, err := getRestoreWithArgs(args...)
@@ -1276,7 +1095,7 @@ func TestFixHashedIndexes(t *testing.T) {
 					} else if key.Key == "a.b" {
 						So(key.Value, ShouldEqual, "hashed")
 					} else if key.Key != "_id" {
-						t.Fatalf("Unexepected Index: %v", key.Key)
+						t.Fatalf("Unexpected Index: %v", key.Key)
 					}
 				}
 			}
@@ -1288,7 +1107,7 @@ func TestAutoIndexIdLocalDB(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	ctx := t.Context()
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1304,7 +1123,7 @@ func TestAutoIndexIdLocalDB(t *testing.T) {
 		)
 	}
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -1320,7 +1139,7 @@ func TestAutoIndexIdLocalDB(t *testing.T) {
 			//nolint:errcheck
 			defer dbName.Collection("test_auto_idx").Drop(ctx)
 
-			opts, err := ParseOptions(testutil.GetBareArgs(), "", "")
+			opts, err := ParseOptions(testopts.GetBareArgs(), "", "")
 			So(err, ShouldBeNil)
 
 			// Set retryWrites to false since it is unsupported on `local` db.
@@ -1359,7 +1178,7 @@ func TestAutoIndexIdNonLocalDB(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	ctx := t.Context()
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1375,7 +1194,7 @@ func TestAutoIndexIdNonLocalDB(t *testing.T) {
 		)
 	}
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	if err != nil {
 		t.Fatalf("No server available")
 	}
@@ -1487,9 +1306,13 @@ func TestAutoIndexIdNonLocalDB(t *testing.T) {
 // related tables aren't applied via applyops when replaying the oplog.
 func TestSkipSystemCollections(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it replays an oplog, and DSC does not support the applyOps command",
+	)
 	ctx := t.Context()
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1568,9 +1391,13 @@ func TestSkipSystemCollections(t *testing.T) {
 // entries are skipped when restoring the oplog.
 func TestSkipStartAndAbortIndexBuild(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it replays an oplog, and DSC does not support the applyOps command",
+	)
 	ctx := t.Context()
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1635,10 +1462,14 @@ func TestSkipStartAndAbortIndexBuild(t *testing.T) {
 // TestcommitIndexBuild asserts that all "commitIndexBuild" are converted to creatIndexes commands.
 func TestCommitIndexBuild(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it replays an oplog, and DSC does not support the applyOps command",
+	)
 	ctx := t.Context()
 	testDB := "commit_index"
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1725,10 +1556,14 @@ func TestCommitIndexBuild(t *testing.T) {
 // CreateIndexes oplog will be applied directly for versions < 4.4 and converted to createIndex cmd > 4.4.
 func TestCreateIndexes(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it replays an oplog, and DSC does not support the applyOps command",
+	)
 	ctx := t.Context()
 	testDB := "create_indexes"
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1813,7 +1648,7 @@ func TestGeoHaystackIndexes(t *testing.T) {
 	ctx := t.Context()
 	dbName := "geohaystack_test"
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	if err != nil {
 		t.Fatalf("No cluster available: %v", err)
 	}
@@ -1857,7 +1692,7 @@ func TestGeoHaystackIndexes(t *testing.T) {
 
 // ----------------------------------------------------------------------
 // All tests from this point onwards use testify, not convey. See the
-// CONTRIBUING.md file in the top level of the repo for details on how to
+// CONTRIBUTING.md file in the top level of the repo for details on how to
 // write tests using testify.
 // ----------------------------------------------------------------------
 
@@ -1877,7 +1712,7 @@ func TestRestoreTimeseriesCollections(t *testing.T) {
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
 	dbName := "timeseries_test"
 
-	sessionProvider, _, err := testutil.GetBareSessionProvider()
+	sessionProvider, _, err := testutil.GetBareSessionProvider(t)
 	require.NoError(t, err, "no cluster available")
 
 	defer sessionProvider.Close()
@@ -1890,9 +1725,32 @@ func TestRestoreTimeseriesCollections(t *testing.T) {
 		t.Skip("Requires server with FCV 5.0 or later")
 	}
 
+	serverVersion, err := sessionProvider.ServerVersionArray()
+	require.NoError(t, err, "can get server version")
+
 	testdb := session.Database(dbName)
 	dataColl := testdb.Collection("foo_ts")
 	bucketsColl := testdb.Collection(common.TimeseriesBucketPrefix + "foo_ts")
+
+	// countBuckets returns the number of underlying timeseries buckets for the given logical
+	// collection. On servers that support the rawData API (8.3+), the buckets are no longer
+	// accessible via a separate `system.buckets.*` namespace; direct access is rejected with
+	// CommandNotSupportedOnLegacyTimeseriesBucketsNamespace. Instead we read them from the logical
+	// collection using the rawData option.
+	countBuckets := func(t *testing.T, logicalColl string) int64 {
+		if serverVersion.SupportsRawData() {
+			opts := mopt.Count()
+			require.NoError(t, xoptions.SetInternalCountOptions(opts, "rawData", true))
+			count, err := testdb.Collection(logicalColl).CountDocuments(t.Context(), bson.M{}, opts)
+			require.NoError(t, err)
+			return count
+		}
+
+		count, err := testdb.Collection(common.TimeseriesBucketPrefix+logicalColl).
+			CountDocuments(t.Context(), bson.M{})
+		require.NoError(t, err)
+		return count
+	}
 
 	dropTestDB := func(t *testing.T) {
 		err := testdb.Drop(t.Context())
@@ -1910,9 +1768,7 @@ func TestRestoreTimeseriesCollections(t *testing.T) {
 		require.NoError(t, err)
 		assert.EqualValues(t, 1000, count)
 
-		count, err = bucketsColl.CountDocuments(t.Context(), bson.M{})
-		require.NoError(t, err)
-		assert.EqualValues(t, 10, count)
+		assert.EqualValues(t, 10, countBuckets(t, "foo_ts"))
 	}
 
 	// This checks that there are no docs in either the data or buckets collections.
@@ -1921,9 +1777,7 @@ func TestRestoreTimeseriesCollections(t *testing.T) {
 		require.NoError(t, err)
 		assert.Zero(t, count)
 
-		count, err = bucketsColl.CountDocuments(t.Context(), bson.M{})
-		require.NoError(t, err)
-		assert.Zero(t, count)
+		assert.Zero(t, countBuckets(t, "foo_ts"))
 	}
 
 	t.Run("normal restore", func(t *testing.T) {
@@ -1998,6 +1852,18 @@ func TestRestoreTimeseriesCollections(t *testing.T) {
 	})
 
 	t.Run("oplogReplay and system.buckets", func(t *testing.T) {
+		// This fixture's oplog contains CRUD ops against a legacy `system.buckets.*` namespace
+		// (dumped from a pre-viewless server). Servers that support the rawData API (8.3+) use
+		// viewless timeseries collections where that namespace no longer exists, and applyOps
+		// cannot apply those ops to the logical collection (it rejects the rawData option). So
+		// replaying a legacy system.buckets oplog into a viewless timeseries collection is
+		// unsupported.
+		if serverVersion.SupportsRawData() {
+			t.Skip(
+				"legacy system.buckets oplog replay is unsupported on viewless timeseries servers (8.3+)",
+			)
+		}
+
 		defer dropTestDB(t)
 
 		args := []string{
@@ -2138,10 +2004,7 @@ func TestRestoreTimeseriesCollections(t *testing.T) {
 		require.NoError(t, err)
 		assert.EqualValues(t, 1000, count)
 
-		count, err = testdb.Collection(common.TimeseriesBucketPrefix+"bar_ts").
-			CountDocuments(t.Context(), bson.M{})
-		require.NoError(t, err)
-		assert.EqualValues(t, 10, count)
+		assert.EqualValues(t, 10, countBuckets(t, "bar_ts"))
 	})
 
 	t.Run("system.buckets BSON file as target with metadata", func(t *testing.T) {
@@ -2319,10 +2182,7 @@ func TestRestoreTimeseriesCollections(t *testing.T) {
 		require.NoError(t, err)
 		assert.EqualValues(t, 1000, count)
 
-		count, err = testdb.Collection(common.TimeseriesBucketPrefix+"foo_rename_ts").
-			CountDocuments(t.Context(), bson.M{})
-		require.NoError(t, err)
-		assert.EqualValues(t, 10, count)
+		assert.EqualValues(t, 10, countBuckets(t, "foo_rename_ts"))
 	})
 
 	t.Run("refuse rename of system.bucket", func(t *testing.T) {
@@ -2353,10 +2213,7 @@ func TestRestoreTimeseriesCollections(t *testing.T) {
 		require.NoError(t, err)
 		assert.Zero(t, count)
 
-		count, err = testdb.Collection(renameBucketsName).
-			CountDocuments(t.Context(), bson.M{})
-		require.NoError(t, err)
-		assert.Zero(t, count)
+		assert.Zero(t, countBuckets(t, "foo_rename_ts"))
 	})
 }
 
@@ -2369,8 +2226,12 @@ func TestRestoreClusteredIndex(t *testing.T) {
 	require := require.New(t)
 
 	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	testutil.SkipForDisaggregatedStorage(
+		t,
+		"it replays an oplog, and DSC does not support the applyOps command",
+	)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	require.NoError(err, "can connect to server")
 
 	fcv := testutil.GetFCV(session)
@@ -2400,7 +2261,7 @@ func TestRestoreClusteredIndex(t *testing.T) {
 func testRestoreClusteredIndexFromDump(t *testing.T, indexName string) {
 	require := require.New(t)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	require.NoError(err, "can connect to server")
 
 	dbName := uniqueDBName()
@@ -2434,7 +2295,7 @@ func testRestoreClusteredIndexFromDump(t *testing.T, indexName string) {
 func testRestoreClusteredIndexFromOplog(t *testing.T, indexName string) {
 	require := require.New(t)
 
-	session, err := testutil.GetBareSession()
+	session, err := testutil.GetBareSession(t)
 	require.NoError(err, "can connect to server")
 
 	dbName := uniqueDBName()
@@ -2649,7 +2510,7 @@ func runBSONMongodumpForCollection(
 func runMongodumpWithArgs(t *testing.T, args ...string) {
 	require := require.New(t)
 	cmd := []string{"go", "run", filepath.Join("..", "mongodump", "main")}
-	cmd = append(cmd, testutil.GetBareArgs()...)
+	cmd = append(cmd, testopts.GetBareArgs()...)
 	cmd = append(cmd, args...)
 	out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
 	cmdStr := strings.Join(cmd, " ")

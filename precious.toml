@@ -6,11 +6,7 @@
 # for example from editors on save. Slower tidiers should only be invoked manually, either by
 # running the relevant mage command or by explicitly running `precious` from the CLI.
 
-exclude = [
-  ".agents/**/*",
-  ".claude/**/*",
-  "vendor/**/*",
-]
+exclude = [".agents/**/*", ".claude/**/*", "!.claude/skills/**/*", ".gocache/**/*", "vendor/**/*"]
 
 [commands.golangci-lint]
 type = "both"
@@ -20,36 +16,63 @@ invoke.per-dir-or-once = 7
 working-dir = "root"
 path-args = "dir"
 cmd = [
-    "$PRECIOUS_ROOT/dev-bin/golangci-lint",
+    "mise",
+    "exec",
+    "github:golangci/golangci-lint",
+    "--",
+    "golangci-lint",
     "run",
     "--allow-parallel-runners",
-    "--build-tags", "failpoints",
-    "--color", "always",
-    "--timeout", "5m",
+    "--build-tags",
+    "failpoints",
+    "--color",
+    "always",
+    "--timeout",
+    "5m",
 ]
 tidy-flags = "--fix"
 env = { "FAIL_ON_WARNINGS" = "1" }
 ok-exit-codes = [0]
 lint-failure-exit-codes = [1]
 
-[commands.goimports]
+[commands."golangci-lint formatting"]
+# golangci-lint will lint formatting failures when run with the `run` flag, per the above config.
 type = "tidy"
-include = "**/*.go"
-cmd = [ "$PRECIOUS_ROOT/dev-bin/goimports", "-w" ]
-ok-exit-codes = [0]
-labels = [ "default", "fast-tidy" ]
-
-[commands.golines]
-type = "both"
-include = "**/*.go"
-invoke  = "once"
+include = "*.go"
+invoke.per-dir-or-once = 7
 working-dir = "root"
-path-args = "file"
-# This wrapper will tidy or lint based on the presence of the "--lint" flag.
-cmd = "$PRECIOUS_ROOT/etc/golines-wrapper.sh"
-lint-flags = "--lint"
+path-args = "dir"
+cmd = [
+    "mise",
+    "exec",
+    "github:golangci/golangci-lint",
+    "--",
+    "golangci-lint",
+    "fmt",
+    "--color",
+    "always",
+]
 ok-exit-codes = [0]
 lint-failure-exit-codes = [1]
+labels = ["default", "fast-tidy"]
+
+[commands."go fix"]
+type = "both"
+include = "*.go"
+# The code in common/json is a forked copy of an older version of stdlib's json package. We don't
+# want to modernize it.
+exclude = "common/json/**/*.go"
+invoke.per-dir-or-once = 7
+working-dir = "root"
+# What we really want is something like "dir-with-dot" so we get paths like "./verifier" instead of
+# "verifier", but absolute paths work okay. See
+# https://github.com/houseabsolute/precious/issues/104.
+path-args = "absolute-dir"
+cmd = ["mise", "exec", "go", "--", "go", "fix", "-tags", "mstests,ruleguard"]
+lint-flags = "-diff"
+ok-exit-codes = 0
+lint-failure-exit-codes = 1
+labels = ["default", "fast-tidy"]
 
 # We could run this via golangci-lint but we want to exclude more directories
 # for gosec than we do for other linting. There doesn't seem to be a way to
@@ -57,12 +80,7 @@ lint-failure-exit-codes = [1]
 [commands.gosec]
 type = "lint"
 include = "**/*.go"
-exclude = [
-    "buildscript/**/*.go",
-    "common/testutil/**/*.go",
-    "release/**/*.go",
-    "vendor/**/*.go",
-]
+exclude = ["buildscript/**/*.go", "common/testutil/**/*.go", "release/**/*.go", "vendor/**/*.go"]
 invoke.per-dir-or-once = 7
 working-dir = "root"
 path-args = "dir"
@@ -73,45 +91,28 @@ cmd = [
     # This rule complains about reading or writing to paths based on user input,
     # but most of the tools exist for the purpose of reading and writing from/to
     # user-provided paths.
-    "-exclude", "G304",
-    "-severity", "high",
+    "-exclude",
+    "G304",
+    "-severity",
+    "high",
     "-terse",
 ]
 ok_exit_codes = [0]
 lint_failure_exit_codes = [1]
 
-[commands.prettier-yaml]
+[commands.oxfmt]
 type = "both"
 invoke = "once"
 working-dir = "root"
 path-args = "file"
-include = [ "**/*.yml", "**/*.yaml" ]
-cmd = "$PRECIOUS_ROOT/node_modules/.bin/prettier"
+include = ["*.md", "*.toml", "*.yaml", "*.yml"]
+cmd = ["mise", "exec", "npm:oxfmt", "--", "oxfmt"]
 lint-flags = "--check"
 tidy-flags = "--write"
 ok-exit-codes = [0]
 lint-failure-exit-codes = [1]
 ignore-stderr = ".*"
-labels = [ "default", "fast-tidy" ]
-
-[commands.prettier-md]
-type = "both"
-invoke = "once"
-working-dir = "root"
-path-args = "file"
-include = [ "*.md" ]
-exclude = [ "docs/superpowers/**/*.md" ]
-cmd = [
-    "$PRECIOUS_ROOT/node_modules/.bin/prettier",
-    "--print-width", "100",
-    "--prose-wrap", "always",
-]
-lint-flags = "--check"
-tidy-flags = "--write"
-ok-exit-codes = [0]
-lint-failure-exit-codes = [1]
-ignore-stderr = ".*"
-labels = [ "default", "fast-tidy" ]
+labels = ["default", "fast-tidy"]
 
 # It'd be nice to use prettier to tidy the JS code too, but it seems to make
 # changes that cause it to fail to parse with the versions of the Mongo shell
@@ -123,8 +124,83 @@ invoke = "once"
 working-dir = "root"
 path-args = "file"
 include = "test/qa-tests/jstests/**/*.js"
-cmd = "$PRECIOUS_ROOT/node_modules/.bin/eslint"
+cmd = ["mise", "exec", "npm:eslint", "--", "eslint"]
 tidy-flags = "--fix"
+ok-exit-codes = [0]
+lint-failure-exit-codes = [1]
+
+[commands.typos]
+type = "both"
+include = "**/*"
+exclude = [
+    ".golangci.yml",
+    "*.archive",
+    "*.bmp",
+    "*.bson",
+    "*.csr",
+    "*.gz",
+    "*.journal",
+    "**/bsondump/testdata/sample.json",
+    "**/mongofiles/testdata/lorem_ipsum_*.txt",
+]
+cmd = ["mise", "exec", "github:crate-ci/typos", "--", "typos", "--sort"]
+tidy-flags = "--write-changes"
+invoke = "once"
+ok-exit-codes = 0
+lint-failure-exit-codes = 2
+
+[commands.omegasort-gitignore]
+type = "both"
+include = "**/.gitignore"
+cmd = [
+    "mise",
+    "exec",
+    "github:houseabsolute/omegasort",
+    "--",
+    "omegasort",
+    "--sort=gitignore",
+    "--unique",
+]
+lint-flags = "--check"
+tidy-flags = "--in-place"
+ok-exit-codes = 0
+lint-failure-exit-codes = 1
+ignore-stderr = ".*"
+labels = ["default", "fast-tidy"]
+
+[commands.shellcheck]
+type = "lint"
+include = "**/*.sh"
+exclude = "etc/mise.run.sh"
+cmd = [
+    "mise",
+    "exec",
+    "github:koalaman/shellcheck",
+    "--",
+    "shellcheck",
+    "--color=always",
+    "--external-sources",
+]
+ok-exit-codes = 0
+lint-failure-exit-codes = 1
+
+[commands.shfmt]
+type = "both"
+include = "**/*.sh"
+exclude = "etc/mise.run.sh"
+cmd = ["mise", "exec", "github:mvdan/sh", "--", "shfmt", "--simplify", "--indent", "4"]
+lint-flags = "--diff"
+tidy-flags = "--write"
+ok-exit-codes = 0
+lint-failure-exit-codes = 1
+labels = ["default", "fast-tidy"]
+
+[commands.evergreen-validate]
+type = "lint"
+invoke = "once"
+path-args = "none"
+include = ["common.yml", "mongodump_passthrough/*.yml"]
+cmd = ["$PRECIOUS_ROOT/etc/evergreen-validate-wrapper.sh"]
 ok-exit-codes = [0]
 lint-failure-exit-codes = [1]
 
@@ -135,7 +211,7 @@ path-args = "none"
 # We need to run this whenever new files are added to make sure they have an owner, so it's easiest
 # to just apply this linter to all files.
 include = "**/*"
-cmd = [ "$PRECIOUS_ROOT/etc/github-codeowners-wrapper.sh" ]
+cmd = ["$PRECIOUS_ROOT/etc/github-codeowners-wrapper.sh"]
 ok_exit_codes = 0
 lint_failure_exit_codes = 1
-labels = [ "default", "fast-tidy" ]
+labels = ["default", "fast-tidy"]

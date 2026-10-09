@@ -43,7 +43,7 @@ func (dump *MongoDump) dumpMetadata(
 	meta := Metadata{
 		// We have to initialize Indexes to an empty slice, not nil, so that an empty
 		// array is marshaled into json instead of null. That is, {indexes:[]} is okay
-		// but {indexes:null} will cause assertions in our legacy C++ mongotools
+		// but {indexes:null} is not.
 		Indexes: []bson.D{},
 	}
 
@@ -62,8 +62,7 @@ func (dump *MongoDump) dumpMetadata(
 		meta.Type = intent.Type
 	}
 
-	// Second, we read the collection's index information by either calling
-	// listIndexes (pre-2.7 systems) or querying system.indexes.
+	// Second, we read the collection's index information by calling listIndexes.
 	// We keep a running list of all the indexes
 	// for the current collection as we iterate over the cursor, and include
 	// that list as the "indexes" field of the metadata document.
@@ -87,7 +86,11 @@ func (dump *MongoDump) dumpMetadata(
 			return err
 		}
 		if indexesIter == nil {
-			log.Logvf(log.Always, "the collection %#q appears to have been dropped after the dump started", intent.Namespace())
+			log.Logvf(
+				log.Always,
+				"the collection %#q appears to have been dropped after the dump started",
+				intent.Namespace(),
+			)
 			return nil
 		}
 		defer indexesIter.Close(context.Background())
@@ -104,7 +107,11 @@ func (dump *MongoDump) dumpMetadata(
 		}
 
 		if err := indexesIter.Err(); err != nil {
-			return fmt.Errorf("error getting indexes for collection %#q: %v", intent.Namespace(), err)
+			return fmt.Errorf(
+				"error getting indexes for collection %#q: %v",
+				intent.Namespace(),
+				err,
+			)
 		}
 	}
 
