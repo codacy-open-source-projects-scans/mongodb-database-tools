@@ -84,8 +84,9 @@ exclude = ["buildscript/**/*.go", "common/testutil/**/*.go", "release/**/*.go", 
 invoke.per-dir-or-once = 7
 working-dir = "root"
 path-args = "dir"
-# This wrapper lets us control the output with an env var so we can generate a
-# SARIF report in Evergreen but use the default format for linting.
+# This wrapper lets us control the output with an env var so we can generate a SARIF report for
+# release snapshots (see scripts/generate-release-ssdlc-files.sh) but use the default format for
+# regular linting.
 cmd = [
     "$PRECIOUS_ROOT/etc/gosec-wrapper.sh",
     # This rule complains about reading or writing to paths based on user input,
@@ -105,7 +106,8 @@ type = "both"
 invoke = "once"
 working-dir = "root"
 path-args = "file"
-include = ["*.md", "*.toml", "*.yaml", "*.yml"]
+include = ["*.json", "*.md", "*.toml", "*.yml", "*.yaml"]
+exclude = "**/testdata/**"
 cmd = ["mise", "exec", "npm:oxfmt", "--", "oxfmt"]
 lint-flags = "--check"
 tidy-flags = "--write"
@@ -142,6 +144,7 @@ exclude = [
     "*.journal",
     "**/bsondump/testdata/sample.json",
     "**/mongofiles/testdata/lorem_ipsum_*.txt",
+    "ssdlc/**/*",
 ]
 cmd = ["mise", "exec", "github:crate-ci/typos", "--", "typos", "--sort"]
 tidy-flags = "--write-changes"
